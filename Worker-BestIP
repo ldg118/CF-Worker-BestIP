@@ -1,0 +1,1526 @@
+// Cloudflare Worker 优选IP可视化面板 + 自动DNS + 在线测速 + 多IP支持
+// 需要绑定的KV命名空间：CF_IP_KV
+// 需要在环境变量中设置：ADMIN_PASSWORD
+// 可选环境变量：IP_COUNT (1-5，默认1)
+
+const CONFIG = {
+  sources: [
+    'https://ip.164746.xyz',
+    'https://cf.090227.xyz',
+    'https://monitor.gacjie.cn/page/cloudflare/ipv4.html',
+    'https://stock.hostmonit.com/CloudFlareYes'
+  ],
+  defaultInterval: 12,
+  kvKeys: {
+    ipList: 'ip_list',
+    lastUpdate: 'last_update',
+    dnsConfig: 'dns_config',
+    speedTestResults: 'speed_results',
+    sessions: 'sessions'
+  }
+};
+
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    const path = url.pathname;
+
+    // 处理 CORS 预检请求
+    if (request.method === 'OPTIONS') {
+      return new Response(null, {
+        headers: {
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+          'Access-Control-Allow-Headers': 'Content-Type',
+        },
+      });
+    }
+
+    // ========== 公开API ==========
+    if (path === '/login') {
+      return new Response(getLoginHTML(), {
+        headers: { 'Content-Type': 'text/html;charset=UTF-8' }
+      });
+    }
+
+    if (path === '/api/login' && request.method === 'POST') {
+      return handleLogin(request, env);
+    }
+
+    if (path === '/api/check-auth') {
+      return handleCheckAuth(request, env);
+    }
+
+    if (path === '/api/logout' && request.method === 'POST') {
+      return handleLogout(request, env);
+    }
+
+    // ========== 需要验证的API ==========
+    const sessionId = getSessionId(request);
+    if (!await verifySession(sessionId, env)) {
+      if (path.startsWith('/api/')) {
+        return new Response(JSON.stringify({ error: '未授权，请先登录' }), {
+          status: 401,
+          headers: {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*'
+          }
+        });
+      }
+      return Response.redirect(`${url.origin}/login`, 302);
+    }
+
+    // 主页
+    if (path === '/') {
+      return new Response(getHTML(env), {
+        headers: { 'Content-Type': 'text/html;charset=UTF-8' }
+      });
+    }
+
+    // API: 获取IP列表和测速结果
+    if (path === '/api/ips') {
+      const ips = await env.KV.get(CONFIG.kvKeys.ipList, 'json') || [];
+      const speeds = await env.KV.get(CONFIG.kvKeys.speedTestResults, 'json') || {};
+      const lastUpdate = await env.KV.get(CONFIG.kvKeys.lastUpdate) || '--';
+      return new Response(JSON.stringify({ ips, speeds, lastUpdate }), {
+        headers: { 
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*'
+        }
+      });
+    }
+
+    // API: 保存DNS配置
+    if (path === '/api/save-config' && request.method === 'POST') {
+      const config = await request.json();
+      await env.KV.put(CONFIG.kvKeys.dnsConfig, JSON.stringify(config));
+      return new Response(JSON.stringify({ success: true }), {
+        headers: { 
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*'
+        }
+      });
+    }
+
+    // API: 获取DNS配置
+    if (path === '/api/get-config') {
+      const config = await env.KV.get(CONFIG.kvKeys.dnsConfig, 'json') || {
+        apiToken: '',
+        zoneId: '',
+        recordName: '',
+        proxied: true,
+        autoUpdate: false,
+        updateInterval: 12
+      };
+      return new Response(JSON.stringify(config), {
+        headers: { 
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*'
+        }
+      });
+    }
+
+    // API: 手动更新IP列表
+    if (path === '/api/update') {
+      ctx.waitUntil(updateIPs(env));
+      return new Response(JSON.stringify({ status: '更新任务已启动' }), {
+        headers: { 
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*'
+        }
+      });
+    }
+
+    // API: 批量更新DNS
+    if (path === '/api/update-dns' && request.method === 'POST') {
+      const { ips } = await request.json();
+      const config = await env.KV.get(CONFIG.kvKeys.dnsConfig, 'json');
+      
+      if (!config || !config.apiToken || !config.zoneId || !config.recordName) {
+        return new Response(JSON.stringify({ error: 'DNS配置不完整' }), { 
+          status: 400,
+          headers: { 
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*'
+          }
+        });
+      }
+
+      if (!ips || ips.length === 0) {
+        return new Response(JSON.stringify({ error: '请提供至少一个IP' }), { 
+          status: 400,
+          headers: { 
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*'
+          }
+        });
+      }
+
+      const result = await updateDNSBatch(config, ips);
+      return new Response(JSON.stringify({ 
+        success: result.success, 
+        count: result.count,
+        ips: result.ips,
+        errors: result.errors
+      }), {
+        headers: { 
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*'
+        }
+      });
+    }
+
+    // API: 测速
+    if (path === '/api/speedtest' && request.method === 'GET') {
+      const ip = url.searchParams.get('ip');
+      if (!ip) {
+        return new Response(JSON.stringify({ error: '缺少IP参数' }), { 
+          status: 400,
+          headers: { 
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*'
+          }
+        });
+      }
+
+      try {
+        const startTime = Date.now();
+        const testUrl = 'https://speed.cloudflare.com/__down?bytes=1000';
+        
+        const response = await fetch(testUrl, {
+          headers: { 'Host': 'speed.cloudflare.com' },
+          cf: { resolveOverride: ip },
+          signal: AbortSignal.timeout(5000)
+        });
+
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+
+        await response.text();
+        const latency = Date.now() - startTime;
+
+        const speeds = await env.KV.get(CONFIG.kvKeys.speedTestResults, 'json') || {};
+        speeds[ip] = { delay: latency, timestamp: Date.now() };
+        await env.KV.put(CONFIG.kvKeys.speedTestResults, JSON.stringify(speeds));
+
+        return new Response(JSON.stringify({ 
+          success: true, 
+          ip, 
+          latency,
+          timestamp: new Date().toISOString()
+        }), {
+          headers: { 
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*'
+          }
+        });
+
+      } catch (error) {
+        return new Response(JSON.stringify({ 
+          success: false, 
+          ip, 
+          error: error.message 
+        }), {
+          status: 500,
+          headers: { 
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*'
+          }
+        });
+      }
+    }
+
+    // API: 提交测速结果
+    if (path === '/api/submit-speed' && request.method === 'POST') {
+      const { ip, delay } = await request.json();
+      const speeds = await env.KV.get(CONFIG.kvKeys.speedTestResults, 'json') || {};
+      speeds[ip] = { delay, timestamp: Date.now() };
+      await env.KV.put(CONFIG.kvKeys.speedTestResults, JSON.stringify(speeds));
+      return new Response(JSON.stringify({ success: true }), {
+        headers: { 
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*'
+        }
+      });
+    }
+
+    return new Response('Not Found', { status: 404 });
+  },
+
+  // 定时任务
+  async scheduled(event, env, ctx) {
+    console.log('Running scheduled task...');
+    await updateIPs(env);
+    
+    const config = await env.KV.get(CONFIG.kvKeys.dnsConfig, 'json');
+    if (config?.autoUpdate) {
+      const ips = await env.KV.get(CONFIG.kvKeys.ipList, 'json') || [];
+      const speeds = await env.KV.get(CONFIG.kvKeys.speedTestResults, 'json') || {};
+      
+      // 从环境变量获取IP数量
+      const ipCount = parseInt(env.IP_COUNT) || 1;
+      
+      // 创建带延迟的IP数组
+      let ipWithDelay = ips.map(ip => ({ 
+        ip, 
+        delay: speeds[ip]?.delay || Infinity 
+      }));
+      
+      // 过滤掉没有测速结果的IP（如果有测速数据的话）
+      const hasSpeedData = ipWithDelay.some(item => item.delay !== Infinity);
+      if (hasSpeedData) {
+        ipWithDelay = ipWithDelay.filter(item => item.delay !== Infinity);
+      }
+      
+      // 按延迟排序
+      ipWithDelay.sort((a, b) => a.delay - b.delay);
+      
+      // 取前ipCount个IP
+      const bestIPs = ipWithDelay.slice(0, ipCount).map(item => item.ip);
+      
+      if (bestIPs.length > 0) {
+        console.log(`Auto updating DNS to best ${bestIPs.length} IPs:`, bestIPs);
+        await updateDNSBatch(config, bestIPs);
+      }
+    }
+  }
+};
+
+// ========== 登录相关函数 ==========
+
+async function handleLogin(request, env) {
+  try {
+    const { password } = await request.json();
+    
+    if (!env.ADMIN_PASSWORD) {
+      return new Response(JSON.stringify({ 
+        success: false, 
+        error: '管理员密码未配置' 
+      }), {
+        status: 500,
+        headers: { 
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*'
+        }
+      });
+    }
+
+    if (password === env.ADMIN_PASSWORD) {
+      const sessionId = generateSessionId();
+      const sessions = await env.KV.get(CONFIG.kvKeys.sessions, 'json') || {};
+      
+      sessions[sessionId] = {
+        createdAt: Date.now(),
+        expiresAt: Date.now() + 24 * 60 * 60 * 1000
+      };
+      
+      await env.KV.put(CONFIG.kvKeys.sessions, JSON.stringify(sessions));
+
+      return new Response(JSON.stringify({ 
+        success: true, 
+        sessionId,
+        message: '登录成功'
+      }), {
+        headers: { 
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*'
+        }
+      });
+    } else {
+      return new Response(JSON.stringify({ 
+        success: false, 
+        error: '密码错误' 
+      }), {
+        status: 401,
+        headers: { 
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*'
+        }
+      });
+    }
+  } catch (error) {
+    return new Response(JSON.stringify({ 
+      success: false, 
+      error: error.message 
+    }), {
+      status: 500,
+      headers: { 
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*'
+      }
+    });
+  }
+}
+
+async function handleCheckAuth(request, env) {
+  const sessionId = getSessionId(request);
+  const isValid = await verifySession(sessionId, env);
+  
+  return new Response(JSON.stringify({ 
+    authenticated: isValid,
+    hasAdminPassword: !!env.ADMIN_PASSWORD
+  }), {
+    headers: { 
+      'Content-Type': 'application/json',
+      'Access-Control-Allow-Origin': '*'
+    }
+  });
+}
+
+async function handleLogout(request, env) {
+  const sessionId = getSessionId(request);
+  if (sessionId) {
+    const sessions = await env.KV.get(CONFIG.kvKeys.sessions, 'json') || {};
+    delete sessions[sessionId];
+    await env.KV.put(CONFIG.kvKeys.sessions, JSON.stringify(sessions));
+  }
+  
+  return new Response(JSON.stringify({ success: true }), {
+    headers: { 
+      'Content-Type': 'application/json',
+      'Access-Control-Allow-Origin': '*'
+    }
+  });
+}
+
+function getSessionId(request) {
+  const url = new URL(request.url);
+  
+  const cookie = request.headers.get('Cookie');
+  if (cookie) {
+    const match = cookie.match(/sessionId=([^;]+)/);
+    if (match) return match[1];
+  }
+  
+  const auth = request.headers.get('Authorization');
+  if (auth && auth.startsWith('Bearer ')) {
+    return auth.slice(7);
+  }
+  
+  return url.searchParams.get('session');
+}
+
+async function verifySession(sessionId, env) {
+  if (!sessionId) return false;
+  
+  try {
+    const sessions = await env.KV.get(CONFIG.kvKeys.sessions, 'json') || {};
+    const session = sessions[sessionId];
+    
+    if (!session) return false;
+    if (session.expiresAt < Date.now()) {
+      delete sessions[sessionId];
+      await env.KV.put(CONFIG.kvKeys.sessions, JSON.stringify(sessions));
+      return false;
+    }
+    
+    return true;
+  } catch (error) {
+    console.error('Session verification error:', error);
+    return false;
+  }
+}
+
+function generateSessionId() {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  let result = '';
+  for (let i = 0; i < 32; i++) {
+    result += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return result;
+}
+
+// ========== 工具函数 ==========
+
+// 更新IP列表
+async function updateIPs(env) {
+  let allIPs = new Set();
+  
+  for (const source of CONFIG.sources) {
+    try {
+      const resp = await fetch(source);
+      const text = await resp.text();
+      const ips = text.match(/\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b/g) || [];
+      ips.forEach(ip => {
+        if (isValidIPv4(ip)) {
+          allIPs.add(ip);
+        }
+      });
+    } catch (e) {
+      console.log(`抓取失败: ${source}`);
+    }
+  }
+
+  const ipList = Array.from(allIPs).sort(compareIPs);
+  await env.KV.put(CONFIG.kvKeys.ipList, JSON.stringify(ipList));
+  await env.KV.put(CONFIG.kvKeys.lastUpdate, new Date().toISOString());
+  
+  console.log(`Updated IP list: ${ipList.length} IPs`);
+  return ipList;
+}
+
+// IPv4地址验证
+function isValidIPv4(ip) {
+  const parts = ip.split('.');
+  if (parts.length !== 4) return false;
+  
+  for (const part of parts) {
+    const num = parseInt(part, 10);
+    if (isNaN(num) || num < 0 || num > 255) return false;
+    if (part.startsWith('0') && part.length > 1) return false;
+  }
+  
+  if (ip.startsWith('10.') || 
+      ip.startsWith('192.168.') ||
+      (ip.startsWith('172.') && parseInt(parts[1]) >= 16 && parseInt(parts[1]) <= 31) ||
+      ip.startsWith('127.') ||
+      ip.startsWith('169.254.') ||
+      ip === '255.255.255.255') {
+    return false;
+  }
+  
+  return true;
+}
+
+// IP排序
+function compareIPs(a, b) {
+  const aParts = a.split('.').map(Number);
+  const bParts = b.split('.').map(Number);
+  for (let i = 0; i < 4; i++) {
+    if (aParts[i] !== bParts[i]) {
+      return aParts[i] - bParts[i];
+    }
+  }
+  return 0;
+}
+
+// 批量更新DNS
+async function updateDNSBatch(config, ips) {
+  try {
+    const url = `https://api.cloudflare.com/client/v4/zones/${config.zoneId}/dns_records`;
+    
+    // 1. 先获取该域名下的所有现有A记录
+    console.log(`Fetching existing records for ${config.recordName}...`);
+    const listResp = await fetch(`${url}?type=A&name=${config.recordName}`, {
+      headers: {
+        'Authorization': `Bearer ${config.apiToken}`,
+        'Content-Type': 'application/json'
+      }
+    });
+    
+    const listData = await listResp.json();
+    console.log('Existing records:', listData);
+    
+    // 2. 删除所有现有记录
+    if (listData.success && listData.result.length > 0) {
+      console.log(`Deleting ${listData.result.length} existing records...`);
+      for (const record of listData.result) {
+        const deleteResp = await fetch(`${url}/${record.id}`, {
+          method: 'DELETE',
+          headers: {
+            'Authorization': `Bearer ${config.apiToken}`
+          }
+        });
+        const deleteResult = await deleteResp.json();
+        console.log(`Deleted record ${record.id} (${record.content}):`, deleteResult.success);
+      }
+    }
+    
+    // 3. 为每个IP创建新记录
+    console.log(`Creating ${ips.length} new records...`);
+    let successCount = 0;
+    let createdIPs = [];
+    let errors = [];
+    
+    for (const ip of ips) {
+      const dnsData = {
+        type: 'A',
+        name: config.recordName,
+        content: ip,
+        ttl: 120,
+        proxied: config.proxied || false
+      };
+      
+      console.log(`Creating record for IP: ${ip}`, dnsData);
+      
+      const createResp = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${config.apiToken}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(dnsData)
+      });
+      
+      const result = await createResp.json();
+      console.log(`Create result for ${ip}:`, result);
+      
+      if (result.success) {
+        successCount++;
+        createdIPs.push(ip);
+      } else {
+        errors.push({ ip, error: result.errors });
+      }
+    }
+    
+    console.log(`DNS update completed: ${successCount}/${ips.length} records created`);
+    console.log('Created IPs:', createdIPs);
+    
+    return { 
+      success: successCount > 0, 
+      count: successCount,
+      ips: createdIPs,
+      errors: errors
+    };
+    
+  } catch (e) {
+    console.log('DNS批量更新失败:', e);
+    return { success: false, count: 0, ips: [], errors: [{ error: e.message }] };
+  }
+}
+
+// ========== 登录页面HTML ==========
+function getLoginHTML() {
+  return `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CF优选IP · 登录</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      background: #0b1120;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: #e2e8f0;
+    }
+    .login-container {
+      background: #1a2332;
+      border-radius: 24px;
+      padding: 40px;
+      width: 100%;
+      max-width: 400px;
+      border: 1px solid #2d3a4e;
+      box-shadow: 0 20px 25px -5px rgba(0,0,0,0.5);
+    }
+    h1 {
+      font-size: 28px;
+      font-weight: 600;
+      background: linear-gradient(135deg, #60a5fa, #a78bfa);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      margin-bottom: 32px;
+      text-align: center;
+    }
+    .form-group {
+      margin-bottom: 24px;
+    }
+    label {
+      display: block;
+      font-size: 14px;
+      color: #94a3b8;
+      margin-bottom: 8px;
+    }
+    input {
+      width: 100%;
+      padding: 12px 16px;
+      background: #1e2a3a;
+      border: 1px solid #334155;
+      border-radius: 12px;
+      color: #e2e8f0;
+      font-size: 16px;
+      transition: all 0.2s;
+    }
+    input:focus {
+      outline: none;
+      border-color: #60a5fa;
+      box-shadow: 0 0 0 3px rgba(96,165,250,0.2);
+    }
+    button {
+      width: 100%;
+      padding: 12px;
+      background: #2563eb;
+      border: none;
+      border-radius: 12px;
+      color: white;
+      font-size: 16px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    button:hover {
+      background: #1d4ed8;
+      transform: translateY(-1px);
+      box-shadow: 0 4px 12px rgba(37,99,235,0.3);
+    }
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+      transform: none;
+    }
+    .error {
+      background: #991b1b;
+      color: #fecaca;
+      padding: 12px;
+      border-radius: 8px;
+      margin-top: 16px;
+      font-size: 14px;
+      display: none;
+      border: 1px solid #b91c1c;
+    }
+    .hint {
+      margin-top: 16px;
+      text-align: center;
+      color: #64748b;
+      font-size: 13px;
+    }
+  </style>
+</head>
+<body>
+  <div class="login-container">
+    <h1>🔐 管理员登录</h1>
+    
+    <div class="form-group">
+      <label>密码</label>
+      <input type="password" id="password" placeholder="输入管理员密码" onkeypress="handleKeyPress(event)">
+    </div>
+    
+    <button onclick="login()" id="loginBtn">登录</button>
+    
+    <div class="error" id="error"></div>
+    <div class="hint">⚡ 优选IP · 自动DNS · 多IP支持</div>
+  </div>
+
+  <script>
+    async function login() {
+      const password = document.getElementById('password').value;
+      const loginBtn = document.getElementById('loginBtn');
+      const errorDiv = document.getElementById('error');
+      
+      if (!password) {
+        showError('请输入密码');
+        return;
+      }
+
+      loginBtn.disabled = true;
+      loginBtn.textContent = '登录中...';
+      errorDiv.style.display = 'none';
+
+      try {
+        const response = await fetch('/api/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ password })
+        });
+
+        const data = await response.json();
+
+        if (data.success) {
+          document.cookie = \`sessionId=\${data.sessionId}; path=/; max-age=86400; SameSite=Strict\`;
+          window.location.href = '/';
+        } else {
+          showError(data.error || '登录失败');
+        }
+      } catch (error) {
+        showError('网络错误，请重试');
+      } finally {
+        loginBtn.disabled = false;
+        loginBtn.textContent = '登录';
+      }
+    }
+
+    function handleKeyPress(event) {
+      if (event.key === 'Enter') {
+        login();
+      }
+    }
+
+    function showError(message) {
+      const errorDiv = document.getElementById('error');
+      errorDiv.textContent = message;
+      errorDiv.style.display = 'block';
+    }
+
+    async function checkAuth() {
+      try {
+        const response = await fetch('/api/check-auth');
+        const data = await response.json();
+        
+        if (data.authenticated) {
+          window.location.href = '/';
+        }
+      } catch (error) {
+        console.error('Auth check failed:', error);
+      }
+    }
+
+    checkAuth();
+  </script>
+</body>
+</html>`;
+}
+
+// ========== 主界面HTML（简化版，只显示状态） ==========
+function getHTML(env) {
+  // 从环境变量获取IP数量
+  const ipCount = parseInt(env.IP_COUNT) || 1;
+  
+  return `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CF优选IP · 多IP更新 · 在线测速</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      background: #0b1120;
+      margin: 0;
+      min-height: 100vh;
+      color: #e2e8f0;
+    }
+    .container {
+      max-width: 1400px;
+      margin: 0 auto;
+      padding: 24px;
+    }
+    .header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 32px;
+      flex-wrap: wrap;
+      gap: 16px;
+    }
+    h1 {
+      font-size: 28px;
+      font-weight: 600;
+      background: linear-gradient(135deg, #60a5fa, #a78bfa);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      margin: 0;
+    }
+    .badge {
+      background: #1e293b;
+      padding: 6px 12px;
+      border-radius: 20px;
+      font-size: 13px;
+      color: #94a3b8;
+      border: 1px solid #334155;
+    }
+    .logout-btn {
+      background: #4b5563;
+      color: white;
+      border: none;
+      border-radius: 20px;
+      padding: 6px 16px;
+      font-size: 13px;
+      cursor: pointer;
+      transition: 0.2s;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .logout-btn:hover {
+      background: #6b7280;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: 2fr 1fr;
+      gap: 24px;
+    }
+    .card {
+      background: #1a2332;
+      border-radius: 16px;
+      border: 1px solid #2d3a4e;
+      overflow: hidden;
+    }
+    .card-header {
+      padding: 16px 20px;
+      border-bottom: 1px solid #2d3a4e;
+      background: #1e2a3a;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 12px;
+    }
+    .card-header h2 {
+      font-size: 16px;
+      font-weight: 500;
+      margin: 0;
+      color: #e2e8f0;
+    }
+    .card-body {
+      padding: 20px;
+    }
+    .stats {
+      display: flex;
+      gap: 20px;
+      margin-bottom: 24px;
+      flex-wrap: wrap;
+    }
+    .stat-item {
+      flex: 1;
+      min-width: 120px;
+      background: #1e2a3a;
+      padding: 16px;
+      border-radius: 12px;
+    }
+    .stat-label {
+      font-size: 12px;
+      color: #94a3b8;
+      margin-bottom: 6px;
+    }
+    .stat-value {
+      font-size: 32px;
+      font-weight: 600;
+      color: #60a5fa;
+    }
+    .search-box {
+      width: 100%;
+      padding: 12px 16px;
+      background: #1e2a3a;
+      border: 1px solid #334155;
+      border-radius: 10px;
+      color: #e2e8f0;
+      font-size: 14px;
+      margin-bottom: 20px;
+    }
+    .search-box:focus {
+      outline: none;
+      border-color: #60a5fa;
+    }
+    .table-container {
+      max-height: 500px;
+      overflow-y: auto;
+      border-radius: 10px;
+      border: 1px solid #2d3a4e;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 14px;
+    }
+    th {
+      background: #1e2a3a;
+      padding: 12px;
+      text-align: left;
+      font-weight: 500;
+      color: #94a3b8;
+      position: sticky;
+      top: 0;
+    }
+    td {
+      padding: 12px;
+      border-bottom: 1px solid #2d3a4e;
+    }
+    tr:hover {
+      background: #1e2a3a;
+    }
+    .ip-cell {
+      font-family: monospace;
+      color: #60a5fa;
+    }
+    .delay-cell {
+      font-family: monospace;
+    }
+    .delay-good { color: #4ade80; }
+    .delay-ok { color: #fbbf24; }
+    .delay-bad { color: #f87171; }
+    .btn {
+      padding: 8px 16px;
+      border: none;
+      border-radius: 8px;
+      font-size: 13px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: 0.2s;
+    }
+    .btn-primary {
+      background: #2563eb;
+      color: white;
+    }
+    .btn-primary:hover {
+      background: #1d4ed8;
+    }
+    .btn-primary:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+    .btn-secondary {
+      background: #334155;
+      color: #e2e8f0;
+    }
+    .btn-secondary:hover {
+      background: #475569;
+    }
+    .btn-success {
+      background: #059669;
+      color: white;
+    }
+    .btn-success:hover {
+      background: #047857;
+    }
+    .btn-warning {
+      background: #d97706;
+      color: white;
+    }
+    .btn-warning:hover {
+      background: #b45309;
+    }
+    .btn-sm {
+      padding: 4px 8px;
+      font-size: 12px;
+      margin: 0 2px;
+    }
+    .form-group {
+      margin-bottom: 16px;
+    }
+    .form-group label {
+      display: block;
+      font-size: 13px;
+      color: #94a3b8;
+      margin-bottom: 6px;
+    }
+    .form-group input, .form-group select {
+      width: 100%;
+      padding: 10px 12px;
+      background: #1e2a3a;
+      border: 1px solid #334155;
+      border-radius: 8px;
+      color: #e2e8f0;
+      font-size: 14px;
+    }
+    .form-group input:focus {
+      outline: none;
+      border-color: #60a5fa;
+    }
+    .checkbox {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .checkbox input {
+      width: auto;
+    }
+    .log-panel {
+      background: #111827;
+      border-radius: 10px;
+      padding: 16px;
+      font-family: monospace;
+      font-size: 12px;
+      height: 200px;
+      overflow-y: auto;
+      border: 1px solid #2d3a4e;
+      margin-top: 20px;
+    }
+    .log-entry {
+      color: #94a3b8;
+      margin-bottom: 4px;
+      line-height: 1.6;
+    }
+    .log-time {
+      color: #4b5563;
+      margin-right: 8px;
+    }
+    .progress-bar {
+      width: 100%;
+      height: 8px;
+      background: #1e2a3a;
+      border-radius: 4px;
+      margin: 16px 0;
+      overflow: hidden;
+      display: none;
+    }
+    .progress-bar-fill {
+      height: 100%;
+      background: linear-gradient(90deg, #60a5fa, #a78bfa);
+      width: 0%;
+      transition: width 0.3s ease;
+    }
+    .speed-status {
+      text-align: center;
+      font-size: 13px;
+      color: #94a3b8;
+      margin: 8px 0;
+      display: none;
+    }
+    .footer {
+      margin-top: 32px;
+      text-align: center;
+      color: #4b5563;
+      font-size: 12px;
+    }
+    @media (max-width: 768px) {
+      .grid {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h1>🌩️ CF优选IP · 多IP更新 · 在线测速</h1>
+      <div style="display: flex; gap: 12px; align-items: center;">
+        <span class="badge" id="lastUpdateBadge">加载中...</span>
+        <button class="logout-btn" onclick="logout()">
+          <span>🚪</span> 登出
+        </button>
+      </div>
+    </div>
+
+    <div class="grid">
+      <!-- 左侧：IP列表卡片 -->
+      <div class="card">
+        <div class="card-header">
+          <h2>📋 IP列表</h2>
+          <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+            <button class="btn btn-sm btn-secondary" onclick="exportTXT()">导出TXT</button>
+            <button class="btn btn-sm btn-primary" onclick="manualUpdate()">刷新列表</button>
+            <button class="btn btn-sm btn-warning" onclick="startSpeedTest()" id="speedTestBtn">⚡ 开始测速</button>
+          </div>
+        </div>
+        <div class="card-body">
+          <div class="stats">
+            <div class="stat-item">
+              <div class="stat-label">总IP数量</div>
+              <div class="stat-value" id="ipCount">0</div>
+            </div>
+            <div class="stat-item">
+              <div class="stat-label">已测速</div>
+              <div class="stat-value" id="speedCount">0</div>
+            </div>
+          </div>
+
+          <!-- 测速进度条 -->
+          <div class="progress-bar" id="speedProgress">
+            <div class="progress-bar-fill" id="speedProgressFill"></div>
+          </div>
+          <div class="speed-status" id="speedStatus"></div>
+
+          <input type="text" class="search-box" id="search" placeholder="🔍 搜索IP...">
+
+          <div class="table-container">
+            <table>
+              <thead>
+                <tr>
+                  <th>IP地址</th>
+                  <th>延迟(ms)</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody id="ipTable">
+                <tr><td colspan="3" style="text-align: center; padding: 40px;">加载中...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- 右侧：DNS配置卡片（简化版，只显示配置项，IP数量由环境变量控制） -->
+      <div class="card">
+        <div class="card-header">
+          <h2>⚙️ DNS自动更新</h2>
+        </div>
+        <div class="card-body">
+          <div class="form-group">
+            <label>Cloudflare API Token</label>
+            <input type="password" id="apiToken" placeholder="输入你的API Token">
+          </div>
+          <div class="form-group">
+            <label>Zone ID</label>
+            <input type="text" id="zoneId" placeholder="输入区域ID">
+          </div>
+          <div class="form-group">
+            <label>要更新的域名</label>
+            <input type="text" id="recordName" placeholder="例如: cf.yourdomain.com">
+          </div>
+          
+          <!-- IP数量显示（只读，由环境变量控制） -->
+          <div class="form-group">
+            <label>更新IP数量 (由环境变量 IP_COUNT 控制)</label>
+            <input type="text" id="ipCountDisplay" value="${ipCount} 个IP" readonly disabled style="background: #2d3a4e; color: #94a3b8;">
+            <div style="font-size: 12px; color: #94a3b8; margin-top: 4px;">
+              当前设置为 ${ipCount} 个IP，如需修改请在Worker环境变量中设置 IP_COUNT
+            </div>
+          </div>
+          
+          <div class="form-group">
+            <label>代理状态</label>
+            <select id="proxied">
+              <option value="true">开启代理 (橙色云)</option>
+              <option value="false">仅DNS (灰色云)</option>
+            </select>
+          </div>
+          <div class="form-group checkbox">
+            <input type="checkbox" id="autoUpdate">
+            <label>自动更新DNS (每小时优选最快IP)</label>
+          </div>
+
+          <div style="margin: 20px 0;">
+            <button class="btn btn-success" style="width: 100%;" onclick="saveConfig()">💾 保存配置</button>
+          </div>
+
+          <div style="margin: 20px 0;">
+            <button class="btn btn-primary" style="width: 100%;" onclick="updateDNSWithBest()" id="updateDNSBtn">
+              🔄 立即用最快IP更新DNS
+            </button>
+          </div>
+
+          <div class="log-panel" id="logPanel">
+            <div class="log-entry"><span class="log-time">[系统]</span> 面板已初始化 | IP数量: ${ipCount}</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="footer">
+      ⚡ 支持在线测速 | 自动更新IP列表 | 当前更新IP数量: ${ipCount} (由环境变量 IP_COUNT 控制)
+    </div>
+  </div>
+
+  <script>
+    let ipList = [];
+    let speeds = {};
+    let dnsConfig = {};
+    let isSpeedTesting = false;
+    
+    // 从环境变量获取IP数量（由后端传入）
+    const IP_COUNT = ${ipCount};
+
+    window.onload = async () => {
+      addLog(\`📊 系统配置: 更新IP数量 = \${IP_COUNT} (环境变量)\`);
+      const auth = await checkAuth();
+      if (auth) {
+        await loadConfig();
+        await loadIPs();
+      }
+    };
+
+    async function checkAuth() {
+      try {
+        const response = await fetch('/api/check-auth');
+        const data = await response.json();
+        
+        if (!data.authenticated) {
+          window.location.href = '/login';
+          return false;
+        }
+        return true;
+      } catch (error) {
+        console.error('Auth check failed:', error);
+        window.location.href = '/login';
+        return false;
+      }
+    }
+
+    async function logout() {
+      try {
+        await fetch('/api/logout', { method: 'POST' });
+        document.cookie = 'sessionId=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT';
+        window.location.href = '/login';
+      } catch (error) {
+        console.error('Logout failed:', error);
+      }
+    }
+
+    async function loadConfig() {
+      try {
+        const resp = await fetch('/api/get-config');
+        dnsConfig = await resp.json();
+        
+        document.getElementById('apiToken').value = dnsConfig.apiToken || '';
+        document.getElementById('zoneId').value = dnsConfig.zoneId || '';
+        document.getElementById('recordName').value = dnsConfig.recordName || '';
+        document.getElementById('proxied').value = dnsConfig.proxied ? 'true' : 'false';
+        document.getElementById('autoUpdate').checked = dnsConfig.autoUpdate || false;
+        
+        addLog('✅ 配置加载成功');
+      } catch (e) {
+        addLog('❌ 加载配置失败');
+      }
+    }
+
+    async function saveConfig() {
+      const config = {
+        apiToken: document.getElementById('apiToken').value,
+        zoneId: document.getElementById('zoneId').value,
+        recordName: document.getElementById('recordName').value,
+        proxied: document.getElementById('proxied').value === 'true',
+        autoUpdate: document.getElementById('autoUpdate').checked,
+        updateInterval: 12
+      };
+
+      addLog('💾 正在保存配置...');
+
+      try {
+        const resp = await fetch('/api/save-config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(config)
+        });
+        const data = await resp.json();
+        if (data.success) {
+          dnsConfig = config;
+          addLog('✅ 配置保存成功');
+        } else {
+          addLog('❌ 保存失败');
+        }
+      } catch (e) {
+        addLog('❌ 保存失败');
+      }
+    }
+
+    async function loadIPs() {
+      try {
+        const resp = await fetch('/api/ips');
+        const data = await resp.json();
+        ipList = data.ips || [];
+        speeds = data.speeds || {};
+        
+        document.getElementById('ipCount').innerText = ipList.length;
+        document.getElementById('speedCount').innerText = Object.keys(speeds).length;
+        document.getElementById('lastUpdateBadge').innerText = data.lastUpdate ? 
+          '最后更新: ' + new Date(data.lastUpdate).toLocaleString() : '暂无更新';
+        
+        renderTable(ipList);
+        addLog(\`✅ 已加载 \${ipList.length} 个IP\`);
+      } catch (e) {
+        addLog('❌ 加载IP失败');
+      }
+    }
+
+    function renderTable(ips) {
+      const searchTerm = document.getElementById('search').value.toLowerCase();
+      
+      let ipWithDelay = ips.map(ip => ({
+        ip,
+        delay: speeds[ip] ? speeds[ip].delay : Infinity
+      }));
+      
+      ipWithDelay.sort((a, b) => a.delay - b.delay);
+      
+      const filtered = ipWithDelay.filter(item => 
+        item.ip.toLowerCase().includes(searchTerm)
+      );
+      
+      let html = '';
+      filtered.forEach(item => {
+        const ip = item.ip;
+        const speed = speeds[ip];
+        const delay = speed ? speed.delay : '--';
+        const delayClass = speed ? 
+          (speed.delay < 100 ? 'delay-good' : (speed.delay < 200 ? 'delay-ok' : 'delay-bad')) 
+          : '';
+        
+        html += \`<tr>
+          <td class="ip-cell">\${ip}</td>
+          <td class="delay-cell \${delayClass}">\${delay}</td>
+          <td>
+            <button class="btn btn-sm btn-secondary" onclick="copyIP('\${ip}')">复制</button>
+          </td>
+        </tr>\`;
+      });
+      
+      if (filtered.length === 0) {
+        html = '<tr><td colspan="3" style="text-align: center; padding: 20px;">没有匹配的IP</td></tr>';
+      }
+      
+      document.getElementById('ipTable').innerHTML = html;
+    }
+
+    document.getElementById('search').addEventListener('input', () => {
+      renderTable(ipList);
+    });
+
+    async function manualUpdate() {
+      addLog('⏳ 正在更新IP列表...');
+      try {
+        const resp = await fetch('/api/update');
+        const data = await resp.json();
+        addLog(\`✅ \${data.status}\`);
+        setTimeout(loadIPs, 2000);
+      } catch (e) {
+        addLog('❌ 更新失败');
+      }
+    }
+
+    async function exportTXT() {
+      const text = ipList.join('\\n');
+      const blob = new Blob([text], { type: 'text/plain' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = \`cf_ips_\${new Date().toISOString().slice(0,10)}.txt\`;
+      a.click();
+      URL.revokeObjectURL(url);
+      addLog('📥 已导出TXT文件');
+    }
+
+    function copyIP(ip) {
+      navigator.clipboard.writeText(ip);
+      addLog(\`📋 已复制: \${ip}\`);
+    }
+
+    // 获取最快IPs（使用环境变量IP_COUNT）
+    async function getBestIPs() {
+      addLog(\`🔍 获取最快的 \${IP_COUNT} 个IP (环境变量)\`);
+      
+      let ipWithDelay = ipList.map(ip => ({
+        ip,
+        delay: speeds[ip] ? speeds[ip].delay : Infinity
+      }));
+      
+      const hasSpeedData = ipWithDelay.some(item => item.delay !== Infinity);
+      if (hasSpeedData) {
+        ipWithDelay = ipWithDelay.filter(item => item.delay !== Infinity);
+      }
+      
+      ipWithDelay.sort((a, b) => a.delay - b.delay);
+      
+      return ipWithDelay.slice(0, IP_COUNT).map(item => item.ip);
+    }
+
+    // 更新DNS
+    async function updateDNSWithBest() {
+      addLog(\`🔍 正在获取最快的 \${IP_COUNT} 个IP (环境变量)...\`);
+      
+      const bestIPs = await getBestIPs();
+      
+      if (bestIPs.length === 0) {
+        addLog('❌ 没有可用的IP');
+        return;
+      }
+
+      addLog(\`⏳ 正在更新DNS，使用 \${bestIPs.length} 个IP: \${bestIPs.join(', ')}...\`);
+      
+      try {
+        const resp = await fetch('/api/update-dns', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ips: bestIPs })
+        });
+        const data = await resp.json();
+        if (data.success) {
+          addLog(\`✅ DNS更新成功，共更新 \${data.count} 个IP: \${data.ips.join(', ')}\`);
+        } else {
+          addLog('❌ DNS更新失败，请检查配置');
+        }
+      } catch (e) {
+        addLog('❌ DNS更新失败');
+      }
+    }
+
+    // 开始测速
+    async function startSpeedTest() {
+      if (isSpeedTesting) {
+        addLog('⏳ 测速已在进行中，请稍候...');
+        return;
+      }
+      
+      if (ipList.length === 0) {
+        addLog('❌ 没有可测速的IP');
+        return;
+      }
+
+      const speedTestBtn = document.getElementById('speedTestBtn');
+      const progressBar = document.getElementById('speedProgress');
+      const progressFill = document.getElementById('speedProgressFill');
+      const speedStatus = document.getElementById('speedStatus');
+      
+      isSpeedTesting = true;
+      speedTestBtn.disabled = true;
+      speedTestBtn.textContent = '测速中...';
+      progressBar.style.display = 'block';
+      speedStatus.style.display = 'block';
+      
+      addLog(\`⚡ 开始测速，共 \${ipList.length} 个IP...\`);
+      
+      speeds = {};
+      
+      for (let i = 0; i < ipList.length; i++) {
+        if (!isSpeedTesting) break;
+        
+        const ip = ipList[i];
+        const progress = ((i + 1) / ipList.length * 100).toFixed(1);
+        
+        speedStatus.innerHTML = \`正在测速: \${i+1}/\${ipList.length} (\${progress}%) - \${ip}\`;
+        progressFill.style.width = \`\${progress}%\`;
+        
+        try {
+          const response = await fetch(\`/api/speedtest?ip=\${ip}\`);
+          const data = await response.json();
+          
+          if (data.success) {
+            speeds[ip] = { delay: data.latency };
+            addLog(\`✅ \${ip} - \${data.latency}ms\`);
+          } else {
+            addLog(\`❌ \${ip} - 失败\`);
+          }
+        } catch (error) {
+          addLog(\`❌ \${ip} - 请求失败\`);
+        }
+        
+        renderTable(ipList);
+        
+        if ((i + 1) % 5 === 0 && i < ipList.length - 1) {
+          await new Promise(resolve => setTimeout(resolve, 500));
+        }
+      }
+      
+      const bestIPs = await getBestIPs();
+      
+      if (bestIPs.length > 0) {
+        addLog(\`⚡ 测速完成，自动更新最快的 \${bestIPs.length} 个IP...\`);
+        
+        try {
+          const resp = await fetch('/api/update-dns', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ips: bestIPs })
+          });
+          const data = await resp.json();
+          if (data.success) {
+            addLog(\`✅ DNS自动更新成功，共更新 \${data.count} 个IP: \${data.ips.join(', ')}\`);
+          } else {
+            addLog('❌ DNS自动更新失败，请检查配置');
+          }
+        } catch (e) {
+          addLog('❌ DNS自动更新失败');
+        }
+      } else {
+        addLog('⚠️ 测速完成，但没有可用的IP进行更新');
+      }
+      
+      isSpeedTesting = false;
+      speedTestBtn.disabled = false;
+      speedTestBtn.textContent = '⚡ 开始测速';
+      progressBar.style.display = 'none';
+      speedStatus.style.display = 'none';
+      
+      document.getElementById('speedCount').innerText = Object.keys(speeds).length;
+      renderTable(ipList);
+    }
+
+    function addLog(msg) {
+      const panel = document.getElementById('logPanel');
+      const time = new Date().toLocaleTimeString();
+      panel.innerHTML += \`<div class="log-entry"><span class="log-time">[\${time}]</span> \${msg}</div>\`;
+      panel.scrollTop = panel.scrollHeight;
+    }
+  </script>
+</body>
+</html>`;
+}
