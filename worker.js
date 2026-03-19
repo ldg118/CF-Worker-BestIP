@@ -9,8 +9,8 @@ const CONFIG = {
   sources: [
     'https://ip.164746.xyz',
     'https://cf.090227.xyz',
-    'https://monitor.gacjie.cn/page/cloudflare/ipv4.html',
-    'https://stock.hostmonit.com/CloudFlareYes'
+    //'https://monitor.gacjie.cn/page/cloudflare/ipv4.html',
+    //'https://stock.hostmonit.com/CloudFlareYes'
   ],
   defaultInterval: 12,
   kvKeys: {
