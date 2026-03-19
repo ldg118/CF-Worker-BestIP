@@ -1,7 +1,9 @@
-// Cloudflare Worker 优选IP可视化面板 + 自动DNS + 在线测速 + 多IP支持
+// Cloudflare Worker 优选IP可视化面板 + 自动DNS + 在线测速 + 多IP支持 + 多线程测速
 // 需要绑定的KV命名空间：CF_IP_KV
 // 需要在环境变量中设置：ADMIN_PASSWORD
-// 可选环境变量：IP_COUNT (1-5，默认1)
+// 环境变量：DEFAULT_IP_COUNT (1-5，默认3) - 只读，由环境变量控制
+// 环境变量：DEFAULT_TEST_COUNT (1-200，默认50)
+// 环境变量：DEFAULT_THREAD_COUNT (1-20，默认5)
 
 const CONFIG = {
   sources: [
@@ -16,7 +18,9 @@ const CONFIG = {
     lastUpdate: 'last_update',
     dnsConfig: 'dns_config',
     speedTestResults: 'speed_results',
-    sessions: 'sessions'
+    sessions: 'sessions',
+    customIPs: 'custom_ips',
+    uiConfig: 'ui_config'
   }
 };
 
@@ -80,9 +84,92 @@ export default {
     // API: 获取IP列表和测速结果
     if (path === '/api/ips') {
       const ips = await env.KV.get(CONFIG.kvKeys.ipList, 'json') || [];
+      const customIPs = await env.KV.get(CONFIG.kvKeys.customIPs, 'json') || [];
       const speeds = await env.KV.get(CONFIG.kvKeys.speedTestResults, 'json') || {};
       const lastUpdate = await env.KV.get(CONFIG.kvKeys.lastUpdate) || '--';
-      return new Response(JSON.stringify({ ips, speeds, lastUpdate }), {
+      
+      const allIPs = [...new Set([...ips, ...customIPs])];
+      
+      return new Response(JSON.stringify({ 
+        ips: allIPs, 
+        customIPs,
+        speeds, 
+        lastUpdate 
+      }), {
+        headers: { 
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*'
+        }
+      });
+    }
+
+    // ========== 获取界面配置：环境变量强制优先 ==========
+    if (path === '/api/get-ui-config') {
+      // 从KV获取保存的配置
+      const savedConfig = await env.KV.get(CONFIG.kvKeys.uiConfig, 'json') || {};
+      
+      // IP数量 - 强制使用环境变量，默认3
+      let ipCount = 3; // 默认3
+      if (env.DEFAULT_IP_COUNT !== undefined) {
+        ipCount = parseInt(env.DEFAULT_IP_COUNT);
+        ipCount = Math.min(5, Math.max(1, ipCount));
+        console.log(`Using env DEFAULT_IP_COUNT: ${ipCount}`);
+      }
+      
+      // 测试数量 - 环境变量优先，否则使用保存的值或默认50
+      let testCount = 50;
+      if (env.DEFAULT_TEST_COUNT !== undefined) {
+        testCount = parseInt(env.DEFAULT_TEST_COUNT);
+        testCount = Math.min(200, Math.max(1, testCount));
+      } else {
+        testCount = savedConfig.testCount || 50;
+      }
+      
+      // 线程数 - 环境变量优先，否则使用保存的值或默认5
+      let threadCount = 5;
+      if (env.DEFAULT_THREAD_COUNT !== undefined) {
+        threadCount = parseInt(env.DEFAULT_THREAD_COUNT);
+        threadCount = Math.min(20, Math.max(1, threadCount));
+      } else {
+        threadCount = savedConfig.threadCount || 5;
+      }
+      
+      const uiConfig = { ipCount, testCount, threadCount };
+      
+      return new Response(JSON.stringify(uiConfig), {
+        headers: { 
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*'
+        }
+      });
+    }
+
+    // API: 保存界面配置（只保存测试数量和线程数）
+    if (path === '/api/save-ui-config' && request.method === 'POST') {
+      const { testCount, threadCount } = await request.json();
+      
+      const validTestCount = Math.min(200, Math.max(1, parseInt(testCount) || 50));
+      const validThreadCount = Math.min(20, Math.max(1, parseInt(threadCount) || 5));
+      
+      // 获取当前的IP数量（由环境变量控制，不保存）
+      let ipCount = 3; // 默认3
+      if (env.DEFAULT_IP_COUNT !== undefined) {
+        ipCount = parseInt(env.DEFAULT_IP_COUNT);
+        ipCount = Math.min(5, Math.max(1, ipCount));
+      }
+      
+      const uiConfig = {
+        ipCount,
+        testCount: validTestCount,
+        threadCount: validThreadCount
+      };
+      
+      await env.KV.put(CONFIG.kvKeys.uiConfig, JSON.stringify(uiConfig));
+      
+      return new Response(JSON.stringify({ 
+        success: true, 
+        config: uiConfig 
+      }), {
         headers: { 
           'Content-Type': 'application/json',
           'Access-Control-Allow-Origin': '*'
@@ -113,6 +200,63 @@ export default {
         updateInterval: 12
       };
       return new Response(JSON.stringify(config), {
+        headers: { 
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*'
+        }
+      });
+    }
+
+    // API: 保存自定义IP
+    if (path === '/api/save-custom-ips' && request.method === 'POST') {
+      const { ips } = await request.json();
+      
+      const validIPs = [];
+      const invalidIPs = [];
+      const expandedIPs = [];
+      
+      for (const item of ips) {
+        if (isValidIPv4(item)) {
+          validIPs.push(item);
+          expandedIPs.push(item);
+        } else if (isValidCIDR(item)) {
+          const cidrIPs = expandCIDR(item);
+          if (cidrIPs.length > 0) {
+            expandedIPs.push(...cidrIPs);
+            validIPs.push(item);
+          } else {
+            invalidIPs.push(item);
+          }
+        } else {
+          invalidIPs.push(item);
+        }
+      }
+      
+      if (expandedIPs.length > 0) {
+        await env.KV.put(CONFIG.kvKeys.customIPs, JSON.stringify(validIPs));
+        await mergeIPs(env, expandedIPs);
+      }
+      
+      return new Response(JSON.stringify({ 
+        success: true, 
+        validCount: validIPs.length,
+        expandedCount: expandedIPs.length,
+        invalidCount: invalidIPs.length,
+        invalidIPs
+      }), {
+        headers: { 
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*'
+        }
+      });
+    }
+
+    // API: 清除自定义IP
+    if (path === '/api/clear-custom-ips' && request.method === 'POST') {
+      await env.KV.put(CONFIG.kvKeys.customIPs, JSON.stringify([]));
+      await mergeIPs(env, []);
+      
+      return new Response(JSON.stringify({ success: true }), {
         headers: { 
           'Content-Type': 'application/json',
           'Access-Control-Allow-Origin': '*'
@@ -256,27 +400,30 @@ export default {
     const config = await env.KV.get(CONFIG.kvKeys.dnsConfig, 'json');
     if (config?.autoUpdate) {
       const ips = await env.KV.get(CONFIG.kvKeys.ipList, 'json') || [];
+      const customIPs = await env.KV.get(CONFIG.kvKeys.customIPs, 'json') || [];
+      
+      // 环境变量优先，默认3
+      let ipCount = 3;
+      if (env.DEFAULT_IP_COUNT !== undefined) {
+        ipCount = parseInt(env.DEFAULT_IP_COUNT);
+        ipCount = Math.min(5, Math.max(1, ipCount));
+      }
+      
+      const allIPs = [...new Set([...ips, ...customIPs])];
       const speeds = await env.KV.get(CONFIG.kvKeys.speedTestResults, 'json') || {};
       
-      // 从环境变量获取IP数量
-      const ipCount = parseInt(env.IP_COUNT) || 1;
-      
-      // 创建带延迟的IP数组
-      let ipWithDelay = ips.map(ip => ({ 
+      let ipWithDelay = allIPs.map(ip => ({ 
         ip, 
         delay: speeds[ip]?.delay || Infinity 
       }));
       
-      // 过滤掉没有测速结果的IP（如果有测速数据的话）
       const hasSpeedData = ipWithDelay.some(item => item.delay !== Infinity);
       if (hasSpeedData) {
         ipWithDelay = ipWithDelay.filter(item => item.delay !== Infinity);
       }
       
-      // 按延迟排序
       ipWithDelay.sort((a, b) => a.delay - b.delay);
       
-      // 取前ipCount个IP
       const bestIPs = ipWithDelay.slice(0, ipCount).map(item => item.ip);
       
       if (bestIPs.length > 0) {
@@ -288,7 +435,6 @@ export default {
 };
 
 // ========== 登录相关函数 ==========
-
 async function handleLogin(request, env) {
   try {
     const { password } = await request.json();
@@ -433,6 +579,26 @@ function generateSessionId() {
 
 // ========== 工具函数 ==========
 
+async function mergeIPs(env, newExpandedIPs) {
+  const autoIPs = await env.KV.get(CONFIG.kvKeys.ipList, 'json') || [];
+  const customIPs = await env.KV.get(CONFIG.kvKeys.customIPs, 'json') || [];
+  
+  let expandedCustomIPs = [];
+  for (const item of customIPs) {
+    if (item.includes('/')) {
+      const ips = expandCIDR(item);
+      expandedCustomIPs.push(...ips);
+    } else {
+      expandedCustomIPs.push(item);
+    }
+  }
+  
+  const allIPs = [...new Set([...autoIPs, ...expandedCustomIPs, ...(newExpandedIPs || [])])];
+  await env.KV.put(CONFIG.kvKeys.ipList, JSON.stringify(allIPs));
+  
+  return allIPs;
+}
+
 // 更新IP列表
 async function updateIPs(env) {
   let allIPs = new Set();
@@ -454,6 +620,9 @@ async function updateIPs(env) {
 
   const ipList = Array.from(allIPs).sort(compareIPs);
   await env.KV.put(CONFIG.kvKeys.ipList, JSON.stringify(ipList));
+  
+  await mergeIPs(env);
+  
   await env.KV.put(CONFIG.kvKeys.lastUpdate, new Date().toISOString());
   
   console.log(`Updated IP list: ${ipList.length} IPs`);
@@ -483,6 +652,56 @@ function isValidIPv4(ip) {
   return true;
 }
 
+// CIDR格式验证
+function isValidCIDR(cidr) {
+  const parts = cidr.split('/');
+  if (parts.length !== 2) return false;
+  
+  const ip = parts[0];
+  const mask = parseInt(parts[1], 10);
+  
+  if (!isValidIPv4(ip)) return false;
+  if (isNaN(mask) || mask < 16 || mask > 30) return false;
+  
+  return true;
+}
+
+// CIDR展开函数
+function expandCIDR(cidr) {
+  const [baseIP, mask] = cidr.split('/');
+  const maskNum = parseInt(mask, 10);
+  
+  const ipParts = baseIP.split('.').map(Number);
+  const ipNum = (ipParts[0] << 24) | (ipParts[1] << 16) | (ipParts[2] << 8) | ipParts[3];
+  
+  const maskBits = 32 - maskNum;
+  const networkNum = ipNum & (~((1 << maskBits) - 1));
+  const broadcastNum = networkNum | ((1 << maskBits) - 1);
+  
+  const ips = [];
+  
+  const maxIPs = Math.min(256, (1 << maskBits) - 2);
+  
+  for (let i = 1; i <= maxIPs; i++) {
+    const currentNum = networkNum + i;
+    if (currentNum >= broadcastNum) break;
+    
+    const ip = [
+      (currentNum >> 24) & 255,
+      (currentNum >> 16) & 255,
+      (currentNum >> 8) & 255,
+      currentNum & 255
+    ].join('.');
+    
+    if (isValidIPv4(ip)) {
+      ips.push(ip);
+    }
+  }
+  
+  console.log(`Expanded ${cidr} to ${ips.length} IPs`);
+  return ips;
+}
+
 // IP排序
 function compareIPs(a, b) {
   const aParts = a.split('.').map(Number);
@@ -500,8 +719,6 @@ async function updateDNSBatch(config, ips) {
   try {
     const url = `https://api.cloudflare.com/client/v4/zones/${config.zoneId}/dns_records`;
     
-    // 1. 先获取该域名下的所有现有A记录
-    console.log(`Fetching existing records for ${config.recordName}...`);
     const listResp = await fetch(`${url}?type=A&name=${config.recordName}`, {
       headers: {
         'Authorization': `Bearer ${config.apiToken}`,
@@ -510,25 +727,18 @@ async function updateDNSBatch(config, ips) {
     });
     
     const listData = await listResp.json();
-    console.log('Existing records:', listData);
     
-    // 2. 删除所有现有记录
     if (listData.success && listData.result.length > 0) {
-      console.log(`Deleting ${listData.result.length} existing records...`);
       for (const record of listData.result) {
-        const deleteResp = await fetch(`${url}/${record.id}`, {
+        await fetch(`${url}/${record.id}`, {
           method: 'DELETE',
           headers: {
             'Authorization': `Bearer ${config.apiToken}`
           }
         });
-        const deleteResult = await deleteResp.json();
-        console.log(`Deleted record ${record.id} (${record.content}):`, deleteResult.success);
       }
     }
     
-    // 3. 为每个IP创建新记录
-    console.log(`Creating ${ips.length} new records...`);
     let successCount = 0;
     let createdIPs = [];
     let errors = [];
@@ -542,8 +752,6 @@ async function updateDNSBatch(config, ips) {
         proxied: config.proxied || false
       };
       
-      console.log(`Creating record for IP: ${ip}`, dnsData);
-      
       const createResp = await fetch(url, {
         method: 'POST',
         headers: {
@@ -554,8 +762,6 @@ async function updateDNSBatch(config, ips) {
       });
       
       const result = await createResp.json();
-      console.log(`Create result for ${ip}:`, result);
-      
       if (result.success) {
         successCount++;
         createdIPs.push(ip);
@@ -563,9 +769,6 @@ async function updateDNSBatch(config, ips) {
         errors.push({ ip, error: result.errors });
       }
     }
-    
-    console.log(`DNS update completed: ${successCount}/${ips.length} records created`);
-    console.log('Created IPs:', createdIPs);
     
     return { 
       success: successCount > 0, 
@@ -697,7 +900,7 @@ function getLoginHTML() {
     <button onclick="login()" id="loginBtn">登录</button>
     
     <div class="error" id="error"></div>
-    <div class="hint">⚡ 优选IP · 自动DNS · 多IP支持</div>
+    <div class="hint">⚡ 优选IP · 自动DNS · 多线程测速</div>
   </div>
 
   <script>
@@ -769,17 +972,21 @@ function getLoginHTML() {
 </html>`;
 }
 
-// ========== 主界面HTML（简化版，只显示状态） ==========
+// ========== 主界面HTML（IP数量只读，默认3） ==========
 function getHTML(env) {
-  // 从环境变量获取IP数量
-  const ipCount = parseInt(env.IP_COUNT) || 1;
+  // 获取环境变量中的IP数量，默认3
+  let defaultIpCount = 3;
+  if (env.DEFAULT_IP_COUNT !== undefined) {
+    defaultIpCount = parseInt(env.DEFAULT_IP_COUNT);
+    defaultIpCount = Math.min(5, Math.max(1, defaultIpCount));
+  }
   
   return `<!DOCTYPE html>
 <html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>CF优选IP · 多IP更新 · 在线测速</title>
+  <title>CF优选IP · 多线程测速 · 在线测速</title>
   <style>
     * { box-sizing: border-box; }
     body {
@@ -837,6 +1044,11 @@ function getHTML(env) {
     .grid {
       display: grid;
       grid-template-columns: 2fr 1fr;
+      gap: 24px;
+    }
+    .left-column {
+      display: flex;
+      flex-direction: column;
       gap: 24px;
     }
     .card {
@@ -902,7 +1114,7 @@ function getHTML(env) {
       border-color: #60a5fa;
     }
     .table-container {
-      max-height: 500px;
+      max-height: 400px;
       overflow-y: auto;
       border-radius: 10px;
       border: 1px solid #2d3a4e;
@@ -979,6 +1191,13 @@ function getHTML(env) {
     .btn-warning:hover {
       background: #b45309;
     }
+    .btn-danger {
+      background: #b91c1c;
+      color: white;
+    }
+    .btn-danger:hover {
+      background: #991b1b;
+    }
     .btn-sm {
       padding: 4px 8px;
       font-size: 12px;
@@ -993,7 +1212,7 @@ function getHTML(env) {
       color: #94a3b8;
       margin-bottom: 6px;
     }
-    .form-group input, .form-group select {
+    .form-group input, .form-group select, .form-group textarea {
       width: 100%;
       padding: 10px 12px;
       background: #1e2a3a;
@@ -1002,9 +1221,14 @@ function getHTML(env) {
       color: #e2e8f0;
       font-size: 14px;
     }
-    .form-group input:focus {
+    .form-group input:focus, .form-group textarea:focus {
       outline: none;
       border-color: #60a5fa;
+    }
+    .form-group textarea {
+      font-family: monospace;
+      min-height: 100px;
+      resize: vertical;
     }
     .checkbox {
       display: flex;
@@ -1023,7 +1247,6 @@ function getHTML(env) {
       height: 200px;
       overflow-y: auto;
       border: 1px solid #2d3a4e;
-      margin-top: 20px;
     }
     .log-entry {
       color: #94a3b8;
@@ -1062,9 +1285,56 @@ function getHTML(env) {
       color: #4b5563;
       font-size: 12px;
     }
+    .config-section {
+      background: #1e2a3a;
+      border-radius: 8px;
+      padding: 16px;
+      margin-bottom: 20px;
+      border: 1px solid #334155;
+    }
+    .config-section h4 {
+      color: #60a5fa;
+      margin-bottom: 12px;
+      font-size: 14px;
+    }
+    .flex-row {
+      display: flex;
+      gap: 16px;
+      align-items: flex-end;
+      flex-wrap: wrap;
+    }
+    .flex-row .form-group {
+      flex: 1;
+      min-width: 120px;
+      margin-bottom: 0;
+    }
+    .readonly-field {
+      background: #2d3a4e;
+      color: #94a3b8;
+      padding: 10px 12px;
+      border-radius: 8px;
+      font-size: 14px;
+      border: 1px solid #334155;
+      width: 100%;
+    }
+    .button-group {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .full-width {
+      width: 100%;
+    }
     @media (max-width: 768px) {
       .grid {
         grid-template-columns: 1fr;
+      }
+      .flex-row {
+        flex-direction: column;
+        gap: 16px;
+      }
+      .flex-row .form-group {
+        width: 100%;
       }
     }
   </style>
@@ -1072,7 +1342,7 @@ function getHTML(env) {
 <body>
   <div class="container">
     <div class="header">
-      <h1>🌩️ CF优选IP · 多IP更新 · 在线测速</h1>
+      <h1>🌩️ CF优选IP · 多线程测速 · 在线测速</h1>
       <div style="display: flex; gap: 12px; align-items: center;">
         <span class="badge" id="lastUpdateBadge">加载中...</span>
         <button class="logout-btn" onclick="logout()">
@@ -1082,59 +1352,106 @@ function getHTML(env) {
     </div>
 
     <div class="grid">
-      <!-- 左侧：IP列表卡片 -->
-      <div class="card">
-        <div class="card-header">
-          <h2>📋 IP列表</h2>
-          <div style="display: flex; gap: 8px; flex-wrap: wrap;">
-            <button class="btn btn-sm btn-secondary" onclick="exportTXT()">导出TXT</button>
-            <button class="btn btn-sm btn-primary" onclick="manualUpdate()">刷新列表</button>
-            <button class="btn btn-sm btn-warning" onclick="startSpeedTest()" id="speedTestBtn">⚡ 开始测速</button>
+      <!-- 左侧：IP列表 + 日志 -->
+      <div class="left-column">
+        <!-- IP列表卡片 -->
+        <div class="card">
+          <div class="card-header">
+            <h2>📋 IP列表</h2>
+            <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+              <button class="btn btn-sm btn-secondary" onclick="exportTXT()">导出TXT</button>
+              <button class="btn btn-sm btn-primary" onclick="manualUpdate()">刷新列表</button>
+              <button class="btn btn-sm btn-warning" onclick="startSpeedTest()" id="speedTestBtn">⚡ 开始测速</button>
+            </div>
+          </div>
+          <div class="card-body">
+            <div class="stats">
+              <div class="stat-item">
+                <div class="stat-label">总IP数量</div>
+                <div class="stat-value" id="ipCount">0</div>
+              </div>
+              <div class="stat-item">
+                <div class="stat-label">已测速</div>
+                <div class="stat-value" id="speedCount">0</div>
+              </div>
+              <div class="stat-item">
+                <div class="stat-label">测试数量</div>
+                <div class="stat-value" id="testCountDisplay">0</div>
+              </div>
+            </div>
+
+            <!-- 测速进度条 -->
+            <div class="progress-bar" id="speedProgress">
+              <div class="progress-bar-fill" id="speedProgressFill"></div>
+            </div>
+            <div class="speed-status" id="speedStatus"></div>
+
+            <input type="text" class="search-box" id="search" placeholder="🔍 搜索IP...">
+
+            <div class="table-container">
+              <table>
+                <thead>
+                  <tr>
+                    <th>IP地址</th>
+                    <th>延迟(ms)</th>
+                    <th style="width: 80px;">操作</th>
+                  </tr>
+                </thead>
+                <tbody id="ipTable">
+                  <tr><td colspan="3" style="text-align: center; padding: 40px;">加载中...</td></tr>
+                </tbody>
+              </table>
+            </div>
           </div>
         </div>
-        <div class="card-body">
-          <div class="stats">
-            <div class="stat-item">
-              <div class="stat-label">总IP数量</div>
-              <div class="stat-value" id="ipCount">0</div>
-            </div>
-            <div class="stat-item">
-              <div class="stat-label">已测速</div>
-              <div class="stat-value" id="speedCount">0</div>
-            </div>
+
+        <!-- 日志面板（放在左边） -->
+        <div class="card">
+          <div class="card-header">
+            <h2>📝 运行日志</h2>
           </div>
-
-          <!-- 测速进度条 -->
-          <div class="progress-bar" id="speedProgress">
-            <div class="progress-bar-fill" id="speedProgressFill"></div>
-          </div>
-          <div class="speed-status" id="speedStatus"></div>
-
-          <input type="text" class="search-box" id="search" placeholder="🔍 搜索IP...">
-
-          <div class="table-container">
-            <table>
-              <thead>
-                <tr>
-                  <th>IP地址</th>
-                  <th>延迟(ms)</th>
-                  <th>操作</th>
-                </tr>
-              </thead>
-              <tbody id="ipTable">
-                <tr><td colspan="3" style="text-align: center; padding: 40px;">加载中...</td></tr>
-              </tbody>
-            </table>
+          <div class="card-body">
+            <div class="log-panel" id="logPanel">
+              <div class="log-entry"><span class="log-time">[系统]</span> 面板已初始化 | 默认IP数量: ${defaultIpCount}</div>
+            </div>
           </div>
         </div>
       </div>
 
-      <!-- 右侧：DNS配置卡片（简化版，只显示配置项，IP数量由环境变量控制） -->
+      <!-- 右侧：配置卡片 -->
       <div class="card">
         <div class="card-header">
-          <h2>⚙️ DNS自动更新</h2>
+          <h2>⚙️ 配置面板</h2>
         </div>
         <div class="card-body">
+          <!-- 运行参数设置 -->
+          <div class="config-section">
+            <h4>🔧 运行参数设置</h4>
+            <div class="flex-row">
+              <div class="form-group">
+                <label>更新DNS的IP数量 (环境变量控制)</label>
+                <div class="readonly-field" id="ipCountDisplay">${defaultIpCount} 个IP</div>
+                <input type="hidden" id="ipCount" value="${defaultIpCount}">
+              </div>
+              <div class="form-group">
+                <label>每次测速的IP数量 (1-200)</label>
+                <input type="number" id="testCount" min="1" max="200" value="50">
+              </div>
+              <div class="form-group">
+                <label>多线程数 (1-20)</label>
+                <input type="number" id="threadCount" min="1" max="20" value="5">
+              </div>
+            </div>
+            <div class="button-group" style="margin-top: 12px;">
+              <button class="btn btn-primary full-width" onclick="saveUIConfig()">💾 保存运行参数</button>
+            </div>
+            <div style="font-size: 12px; color: #94a3b8; margin-top: 8px;">
+              ⚡ IP数量由环境变量 DEFAULT_IP_COUNT 控制，当前为 ${defaultIpCount} 个
+            </div>
+          </div>
+
+          <!-- DNS配置部分 -->
+          <h3 style="color: #60a5fa; margin-bottom: 16px;">📌 DNS自动更新</h3>
           <div class="form-group">
             <label>Cloudflare API Token</label>
             <input type="password" id="apiToken" placeholder="输入你的API Token">
@@ -1146,15 +1463,6 @@ function getHTML(env) {
           <div class="form-group">
             <label>要更新的域名</label>
             <input type="text" id="recordName" placeholder="例如: cf.yourdomain.com">
-          </div>
-          
-          <!-- IP数量显示（只读，由环境变量控制） -->
-          <div class="form-group">
-            <label>更新IP数量 (由环境变量 IP_COUNT 控制)</label>
-            <input type="text" id="ipCountDisplay" value="${ipCount} 个IP" readonly disabled style="background: #2d3a4e; color: #94a3b8;">
-            <div style="font-size: 12px; color: #94a3b8; margin-top: 4px;">
-              当前设置为 ${ipCount} 个IP，如需修改请在Worker环境变量中设置 IP_COUNT
-            </div>
           </div>
           
           <div class="form-group">
@@ -1169,25 +1477,40 @@ function getHTML(env) {
             <label>自动更新DNS (每小时优选最快IP)</label>
           </div>
 
-          <div style="margin: 20px 0;">
-            <button class="btn btn-success" style="width: 100%;" onclick="saveConfig()">💾 保存配置</button>
-          </div>
-
-          <div style="margin: 20px 0;">
-            <button class="btn btn-primary" style="width: 100%;" onclick="updateDNSWithBest()" id="updateDNSBtn">
-              🔄 立即用最快IP更新DNS
+          <div class="button-group" style="margin: 20px 0;">
+            <button class="btn btn-success" style="flex: 1;" onclick="saveConfig()">💾 保存DNS</button>
+            <button class="btn btn-primary" style="flex: 1;" onclick="updateDNSWithBest()" id="updateDNSBtn">
+              🔄 立即更新
             </button>
           </div>
 
-          <div class="log-panel" id="logPanel">
-            <div class="log-entry"><span class="log-time">[系统]</span> 面板已初始化 | IP数量: ${ipCount}</div>
+          <!-- 分割线 -->
+          <hr style="border: 1px solid #2d3a4e; margin: 24px 0;">
+
+          <!-- 自定义IP导入部分 -->
+          <h3 style="color: #60a5fa; margin-bottom: 16px;">📥 自定义IP导入</h3>
+          <div class="form-group">
+            <label>IP列表 (每行一个IP或CIDR，如: 1.1.1.1 或 172.64.229.0/24)</label>
+            <textarea id="customIPs" placeholder="例如:
+1.1.1.1
+8.8.8.8
+172.64.229.0/24  # 会自动展开成256个IP
+104.16.0.0/24"></textarea>
+            <div style="font-size: 12px; color: #94a3b8; margin-top: 4px;">
+              ⚠️ CIDR格式会自动展开，/24会展开成约250个可用IP
+            </div>
+          </div>
+          <div class="button-group" style="margin-bottom: 20px;">
+            <button class="btn btn-secondary" style="flex: 1;" onclick="loadCustomIPs()">📂 加载</button>
+            <button class="btn btn-success" style="flex: 1;" onclick="saveCustomIPs()">💾 保存</button>
+            <button class="btn btn-danger" style="flex: 1;" onclick="clearCustomIPs()">🗑️ 清除</button>
           </div>
         </div>
       </div>
     </div>
 
     <div class="footer">
-      ⚡ 支持在线测速 | 自动更新IP列表 | 当前更新IP数量: ${ipCount} (由环境变量 IP_COUNT 控制)
+      ⚡ CIDR自动展开 | 多线程测速 | 测速后自动更新最快IP | IP数量由环境变量控制
     </div>
   </div>
 
@@ -1196,14 +1519,21 @@ function getHTML(env) {
     let speeds = {};
     let dnsConfig = {};
     let isSpeedTesting = false;
-    
-    // 从环境变量获取IP数量（由后端传入）
-    const IP_COUNT = ${ipCount};
+    let customIPs = [];
+    let uiConfig = {
+      ipCount: ${defaultIpCount},
+      testCount: 50,
+      threadCount: 5
+    };
+    let activeThreads = 0;
+    let totalTested = 0;
+    let totalToTest = 0;
+    let testQueue = [];
 
     window.onload = async () => {
-      addLog(\`📊 系统配置: 更新IP数量 = \${IP_COUNT} (环境变量)\`);
       const auth = await checkAuth();
       if (auth) {
+        await loadUIConfig();
         await loadConfig();
         await loadIPs();
       }
@@ -1236,6 +1566,91 @@ function getHTML(env) {
       }
     }
 
+    // 加载界面配置
+    async function loadUIConfig() {
+      try {
+        const resp = await fetch('/api/get-ui-config');
+        uiConfig = await resp.json();
+        
+        // 设置IP数量显示（只读）
+        const ipCountDisplay = document.getElementById('ipCountDisplay');
+        if (ipCountDisplay) {
+          ipCountDisplay.innerText = uiConfig.ipCount + ' 个IP';
+        }
+        const ipCountHidden = document.getElementById('ipCount');
+        if (ipCountHidden) {
+          ipCountHidden.value = uiConfig.ipCount;
+        }
+        
+        // 设置测试数量输入框
+        const testCountInput = document.getElementById('testCount');
+        if (testCountInput) {
+          testCountInput.value = uiConfig.testCount;
+        }
+        const testCountDisplay = document.getElementById('testCountDisplay');
+        if (testCountDisplay) {
+          testCountDisplay.innerText = uiConfig.testCount;
+        }
+        
+        // 设置线程数输入框
+        const threadCountInput = document.getElementById('threadCount');
+        if (threadCountInput) {
+          threadCountInput.value = uiConfig.threadCount;
+        }
+        
+        addLog(\`✅ 已加载配置: 更新IP数量 = \${uiConfig.ipCount}, 测试数量 = \${uiConfig.testCount}, 线程数 = \${uiConfig.threadCount}\`);
+      } catch (e) {
+        addLog('📋 首次运行，使用默认配置');
+      }
+    }
+
+    // 保存界面配置（只保存测试数量和线程数）
+    async function saveUIConfig() {
+      const testCount = parseInt(document.getElementById('testCount')?.value) || 50;
+      const threadCount = parseInt(document.getElementById('threadCount')?.value) || 5;
+      
+      // 验证范围
+      const validTestCount = Math.min(200, Math.max(1, testCount));
+      const validThreadCount = Math.min(20, Math.max(1, threadCount));
+      
+      if (validTestCount !== testCount) {
+        const testCountInput = document.getElementById('testCount');
+        if (testCountInput) testCountInput.value = validTestCount;
+        addLog(\`⚠️ 测试数量已自动调整为 \${validTestCount}\`);
+      }
+      
+      if (validThreadCount !== threadCount) {
+        const threadCountInput = document.getElementById('threadCount');
+        if (threadCountInput) threadCountInput.value = validThreadCount;
+        addLog(\`⚠️ 线程数已自动调整为 \${validThreadCount}\`);
+      }
+      
+      addLog(\`💾 正在保存配置: 测试数量 = \${validTestCount}, 线程数 = \${validThreadCount}\`);
+
+      try {
+        const resp = await fetch('/api/save-ui-config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ 
+            testCount: validTestCount,
+            threadCount: validThreadCount
+          })
+        });
+        const data = await resp.json();
+        
+        if (data.success) {
+          uiConfig = data.config;
+          const testCountDisplay = document.getElementById('testCountDisplay');
+          if (testCountDisplay) testCountDisplay.innerText = validTestCount;
+          addLog(\`✅ 配置保存成功\`);
+        } else {
+          addLog('❌ 配置保存失败');
+        }
+      } catch (e) {
+        addLog('❌ 配置保存失败');
+      }
+    }
+
     async function loadConfig() {
       try {
         const resp = await fetch('/api/get-config');
@@ -1247,9 +1662,9 @@ function getHTML(env) {
         document.getElementById('proxied').value = dnsConfig.proxied ? 'true' : 'false';
         document.getElementById('autoUpdate').checked = dnsConfig.autoUpdate || false;
         
-        addLog('✅ 配置加载成功');
+        addLog('✅ DNS配置加载成功');
       } catch (e) {
-        addLog('❌ 加载配置失败');
+        addLog('❌ 加载DNS配置失败');
       }
     }
 
@@ -1263,7 +1678,7 @@ function getHTML(env) {
         updateInterval: 12
       };
 
-      addLog('💾 正在保存配置...');
+      addLog('💾 正在保存DNS配置...');
 
       try {
         const resp = await fetch('/api/save-config', {
@@ -1274,12 +1689,84 @@ function getHTML(env) {
         const data = await resp.json();
         if (data.success) {
           dnsConfig = config;
-          addLog('✅ 配置保存成功');
+          addLog('✅ DNS配置保存成功');
+        } else {
+          addLog('❌ DNS配置保存失败');
+        }
+      } catch (e) {
+        addLog('❌ DNS配置保存失败');
+      }
+    }
+
+    async function loadCustomIPs() {
+      try {
+        const resp = await fetch('/api/ips');
+        const data = await resp.json();
+        customIPs = data.customIPs || [];
+        document.getElementById('customIPs').value = customIPs.join('\\n');
+        addLog(\`📂 已加载 \${customIPs.length} 个自定义IP/CIDR\`);
+      } catch (e) {
+        addLog('❌ 加载自定义IP失败');
+      }
+    }
+
+    async function saveCustomIPs() {
+      const text = document.getElementById('customIPs').value.trim();
+      const lines = text.split('\\n').map(line => line.trim()).filter(line => line.length > 0 && !line.startsWith('#'));
+      
+      if (lines.length === 0) {
+        addLog('⚠️ 没有输入任何IP');
+        return;
+      }
+
+      addLog(\`💾 正在保存 \${lines.length} 个自定义IP/CIDR...\`);
+
+      try {
+        const resp = await fetch('/api/save-custom-ips', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ips: lines })
+        });
+        const data = await resp.json();
+        
+        if (data.success) {
+          addLog(\`✅ 保存成功: \${data.validCount} 个有效条目, 展开后共 \${data.expandedCount} 个IP, \${data.invalidCount} 个无效\`);
+          if (data.invalidCount > 0) {
+            addLog(\`⚠️ 无效条目: \${data.invalidIPs.join(', ')}\`);
+          }
+          setTimeout(loadIPs, 1000);
         } else {
           addLog('❌ 保存失败');
         }
       } catch (e) {
         addLog('❌ 保存失败');
+      }
+    }
+
+    // 清除所有自定义IP
+    async function clearCustomIPs() {
+      if (!confirm('确定要清除所有自定义IP吗？此操作不可恢复！')) {
+        return;
+      }
+      
+      addLog('🗑️ 正在清除所有自定义IP...');
+      
+      try {
+        const resp = await fetch('/api/clear-custom-ips', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' }
+        });
+        const data = await resp.json();
+        
+        if (data.success) {
+          document.getElementById('customIPs').value = '';
+          addLog('✅ 自定义IP已清除');
+          setTimeout(loadIPs, 1000);
+        } else {
+          addLog('❌ 清除失败');
+        }
+      } catch (e) {
+        addLog('❌ 清除失败');
       }
     }
 
@@ -1289,6 +1776,7 @@ function getHTML(env) {
         const data = await resp.json();
         ipList = data.ips || [];
         speeds = data.speeds || {};
+        customIPs = data.customIPs || [];
         
         document.getElementById('ipCount').innerText = ipList.length;
         document.getElementById('speedCount').innerText = Object.keys(speeds).length;
@@ -1296,7 +1784,7 @@ function getHTML(env) {
           '最后更新: ' + new Date(data.lastUpdate).toLocaleString() : '暂无更新';
         
         renderTable(ipList);
-        addLog(\`✅ 已加载 \${ipList.length} 个IP\`);
+        addLog(\`✅ 已加载 \${ipList.length} 个IP (其中自定义条目 \${customIPs.length} 个)\`);
       } catch (e) {
         addLog('❌ 加载IP失败');
       }
@@ -1366,7 +1854,7 @@ function getHTML(env) {
       a.download = \`cf_ips_\${new Date().toISOString().slice(0,10)}.txt\`;
       a.click();
       URL.revokeObjectURL(url);
-      addLog('📥 已导出TXT文件');
+      addLog(\`📥 已导出 \${ipList.length} 个IP\`);
     }
 
     function copyIP(ip) {
@@ -1374,9 +1862,13 @@ function getHTML(env) {
       addLog(\`📋 已复制: \${ip}\`);
     }
 
-    // 获取最快IPs（使用环境变量IP_COUNT）
+    // 获取最快IPs
     async function getBestIPs() {
-      addLog(\`🔍 获取最快的 \${IP_COUNT} 个IP (环境变量)\`);
+      // 从隐藏域获取IP数量
+      const ipCountHidden = document.getElementById('ipCount');
+      let ipCount = parseInt(ipCountHidden?.value) || ${defaultIpCount};
+      
+      addLog(\`🔍 从 \${ipList.length} 个IP中获取最快的 \${ipCount} 个...\`);
       
       let ipWithDelay = ipList.map(ip => ({
         ip,
@@ -1390,12 +1882,14 @@ function getHTML(env) {
       
       ipWithDelay.sort((a, b) => a.delay - b.delay);
       
-      return ipWithDelay.slice(0, IP_COUNT).map(item => item.ip);
+      return ipWithDelay.slice(0, ipCount).map(item => item.ip);
     }
 
-    // 更新DNS
     async function updateDNSWithBest() {
-      addLog(\`🔍 正在获取最快的 \${IP_COUNT} 个IP (环境变量)...\`);
+      const ipCountHidden = document.getElementById('ipCount');
+      let ipCount = parseInt(ipCountHidden?.value) || ${defaultIpCount};
+      
+      addLog(\`🔍 正在获取最快的 \${ipCount} 个IP...\`);
       
       const bestIPs = await getBestIPs();
       
@@ -1423,63 +1917,43 @@ function getHTML(env) {
       }
     }
 
-    // 开始测速
-    async function startSpeedTest() {
-      if (isSpeedTesting) {
-        addLog('⏳ 测速已在进行中，请稍候...');
-        return;
+    // ========== 多线程测速函数 ==========
+    async function speedTestIP(ip) {
+      try {
+        const response = await fetch(\`/api/speedtest?ip=\${ip}\`);
+        const data = await response.json();
+        
+        if (data.success) {
+          speeds[ip] = { delay: data.latency };
+          addLog(\`✅ \${ip} - \${data.latency}ms\`);
+        } else {
+          addLog(\`❌ \${ip} - 失败\`);
+        }
+      } catch (error) {
+        addLog(\`❌ \${ip} - 请求失败\`);
       }
       
-      if (ipList.length === 0) {
-        addLog('❌ 没有可测速的IP');
-        return;
+      totalTested++;
+      const progress = (totalTested / totalToTest * 100).toFixed(1);
+      document.getElementById('speedProgressFill').style.width = \`\${progress}%\`;
+      document.getElementById('speedStatus').innerHTML = \`已完成: \${totalTested}/\${totalToTest} (\${progress}%)\`;
+      
+      renderTable(ipList);
+      
+      // 处理下一个IP
+      if (testQueue.length > 0) {
+        const nextIP = testQueue.shift();
+        await speedTestIP(nextIP);
+      } else {
+        activeThreads--;
+        if (activeThreads === 0) {
+          // 所有线程完成
+          finishSpeedTest();
+        }
       }
+    }
 
-      const speedTestBtn = document.getElementById('speedTestBtn');
-      const progressBar = document.getElementById('speedProgress');
-      const progressFill = document.getElementById('speedProgressFill');
-      const speedStatus = document.getElementById('speedStatus');
-      
-      isSpeedTesting = true;
-      speedTestBtn.disabled = true;
-      speedTestBtn.textContent = '测速中...';
-      progressBar.style.display = 'block';
-      speedStatus.style.display = 'block';
-      
-      addLog(\`⚡ 开始测速，共 \${ipList.length} 个IP...\`);
-      
-      speeds = {};
-      
-      for (let i = 0; i < ipList.length; i++) {
-        if (!isSpeedTesting) break;
-        
-        const ip = ipList[i];
-        const progress = ((i + 1) / ipList.length * 100).toFixed(1);
-        
-        speedStatus.innerHTML = \`正在测速: \${i+1}/\${ipList.length} (\${progress}%) - \${ip}\`;
-        progressFill.style.width = \`\${progress}%\`;
-        
-        try {
-          const response = await fetch(\`/api/speedtest?ip=\${ip}\`);
-          const data = await response.json();
-          
-          if (data.success) {
-            speeds[ip] = { delay: data.latency };
-            addLog(\`✅ \${ip} - \${data.latency}ms\`);
-          } else {
-            addLog(\`❌ \${ip} - 失败\`);
-          }
-        } catch (error) {
-          addLog(\`❌ \${ip} - 请求失败\`);
-        }
-        
-        renderTable(ipList);
-        
-        if ((i + 1) % 5 === 0 && i < ipList.length - 1) {
-          await new Promise(resolve => setTimeout(resolve, 500));
-        }
-      }
-      
+    async function finishSpeedTest() {
       const bestIPs = await getBestIPs();
       
       if (bestIPs.length > 0) {
@@ -1505,13 +1979,58 @@ function getHTML(env) {
       }
       
       isSpeedTesting = false;
-      speedTestBtn.disabled = false;
-      speedTestBtn.textContent = '⚡ 开始测速';
-      progressBar.style.display = 'none';
-      speedStatus.style.display = 'none';
+      document.getElementById('speedTestBtn').disabled = false;
+      document.getElementById('speedTestBtn').textContent = '⚡ 开始测速';
+      document.getElementById('speedProgress').style.display = 'none';
+      document.getElementById('speedStatus').style.display = 'none';
       
       document.getElementById('speedCount').innerText = Object.keys(speeds).length;
       renderTable(ipList);
+    }
+
+    // 开始多线程测速
+    async function startSpeedTest() {
+      if (isSpeedTesting) {
+        addLog('⏳ 测速已在进行中，请稍候...');
+        return;
+      }
+      
+      if (ipList.length === 0) {
+        addLog('❌ 没有可测速的IP');
+        return;
+      }
+
+      const testCount = parseInt(document.getElementById('testCount')?.value) || 50;
+      const threadCount = parseInt(document.getElementById('threadCount')?.value) || 5;
+      
+      isSpeedTesting = true;
+      activeThreads = 0;
+      totalTested = 0;
+      totalToTest = Math.min(testCount, ipList.length);
+      testQueue = ipList.slice(0, totalToTest);
+      
+      const speedTestBtn = document.getElementById('speedTestBtn');
+      const progressBar = document.getElementById('speedProgress');
+      const progressFill = document.getElementById('speedProgressFill');
+      const speedStatus = document.getElementById('speedStatus');
+      
+      speedTestBtn.disabled = true;
+      speedTestBtn.textContent = '测速中...';
+      progressBar.style.display = 'block';
+      speedStatus.style.display = 'block';
+      progressFill.style.width = '0%';
+      
+      addLog(\`⚡ 开始多线程测速，共 \${totalToTest} 个IP，线程数 \${threadCount}\`);
+      
+      // 清空旧的测速结果
+      speeds = {};
+      
+      // 启动线程
+      for (let i = 0; i < threadCount && testQueue.length > 0; i++) {
+        activeThreads++;
+        const ip = testQueue.shift();
+        speedTestIP(ip);
+      }
     }
 
     function addLog(msg) {
