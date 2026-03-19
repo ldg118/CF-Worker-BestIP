@@ -68,7 +68,7 @@ DEFAULT_THREAD_COUNT = "10"
 变量名	说明	默认值	范围
  ```ADMIN_PASSWORD ```	（必填） 管理员登录密码。	无	-
  
- ```DEFAULT_IP_COUNT ```	每次更新 DNS 时，优选 IP 的数量，默认	3，（	范围1 - 5）
+ ```DEFAULT_IP_COUNT ```	每次更新 DNS 时，优选 IP 的数量，默认	3，（	范围1 - 10）
  
  ```DEFAULT_TEST_COUNT ```	每次手动或自动测速时，测试的 IP 数量。默认200	（	范围1 - 1000）
  
