@@ -15,6 +15,7 @@ const GITHUB_URL = 'https://github.com/ldg118/CF-Worker-BestIP';
 
 const CONFIG = {
   sources: [
+//可以自定义IP地址
     'https://ip.164746.xyz',
     'https://cf.090227.xyz',
     'https://monitor.gacjie.cn/page/cloudflare/ipv4.html',
