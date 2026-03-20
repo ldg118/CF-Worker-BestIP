@@ -15,7 +15,10 @@ const GITHUB_URL = 'https://github.com/ldg118/CF-Worker-BestIP';
 
 const CONFIG = {
   sources: [
-   // 'https://raw.githubusercontent.com/ldg118/CF-Worker-BestIP/refs/heads/main/cfv4'
+    'https://ip.164746.xyz',
+    'https://cf.090227.xyz',
+    'https://monitor.gacjie.cn/page/cloudflare/ipv4.html',
+    'https://stock.hostmonit.com/CloudFlareYes
   ],
   kvKeys: {
     ipList: 'ip_list',
