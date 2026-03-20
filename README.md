@@ -58,7 +58,7 @@ Telegram Bot Token（可选，用于通知）
 
 点击 创建命名空间
 
-名称填写：```CF_IP_KV ```
+名称填写：```CF_IP_KV```
 
 点击创建
 
