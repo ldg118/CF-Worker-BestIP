@@ -1,12 +1,17 @@
-// Cloudflare Worker 优选IP可视化面板 - 修复参数和日志问题
+// Cloudflare Worker 优选IP可视化面板 - 最终版（优质池只保存≤90ms）
+// 版本: v2.5.1
+// 项目地址: https://github.com/ldg118/CF-Worker-BestIP
 // 需要绑定的KV命名空间：KV
 // 需要绑定的D1数据库：DB
 // 需要在环境变量中设置：ADMIN_PASSWORD
-// 环境变量：DEFAULT_IP_COUNT (1-5，默认3) - 可选，现在可以在界面修改
+// 环境变量：DEFAULT_IP_COUNT (1-10，默认3)
 // 环境变量：DEFAULT_TEST_COUNT (1-1000，默认50)
 // 环境变量：DEFAULT_THREAD_COUNT (1-50，默认10)
 // 环境变量：FAILED_IP_COOLDOWN_DAYS (1-30，默认15)
 // 环境变量：MAX_HIGH_QUALITY_POOL_SIZE (10-200，默认50)
+
+const VERSION = 'v2.5.1';
+const GITHUB_URL = 'https://github.com/ldg118/CF-Worker-BestIP';
 
 const CONFIG = {
   sources: [
@@ -18,9 +23,7 @@ const CONFIG = {
     dnsConfig: 'dns_config',
     sessions: 'sessions',
     customIPs: 'custom_ips',
-    uiConfig: 'ui_config',
-    regionBestIPs: 'region_best_ips',
-    lastTestIndex: 'last_test_index'
+    uiConfig: 'ui_config'
   }
 };
 
@@ -75,12 +78,6 @@ CREATE TABLE IF NOT EXISTS system_logs (
   time_str TEXT NOT NULL,
   message TEXT NOT NULL
 );
-
--- 创建索引
-CREATE INDEX IF NOT EXISTS idx_speed_results_delay ON speed_results(delay);
-CREATE INDEX IF NOT EXISTS idx_high_quality_latency ON high_quality_ips(latency);
-CREATE INDEX IF NOT EXISTS idx_failed_ips_failed_at ON failed_ips(failed_at);
-CREATE INDEX IF NOT EXISTS idx_system_logs_time ON system_logs(time);
 `;
 
 // ========== 工具函数 ==========
@@ -102,26 +99,41 @@ function isValidCIDR(cidr) {
   return isValidIPv4(ip) && !isNaN(mask) && mask >= 16 && mask <= 30;
 }
 
+// ========== 修复 expandCIDR 函数 ==========
 function expandCIDR(cidr) {
-  const [baseIP, mask] = cidr.split('/');
-  const maskNum = parseInt(mask, 10);
-  const ipParts = baseIP.split('.').map(Number);
-  const ipNum = (ipParts[0] << 24) | (ipParts[1] << 16) | (ipParts[2] << 8) | ipParts[3];
-  const maskBits = 32 - maskNum;
-  const networkNum = ipNum & (~((1 << maskBits) - 1));
-  const ips = [];
-  const maxIPs = Math.min(256, (1 << maskBits) - 2);
-  for (let i = 1; i <= maxIPs; i++) {
-    const currentNum = networkNum + i;
-    const ip = [
-      (currentNum >> 24) & 255,
-      (currentNum >> 16) & 255,
-      (currentNum >> 8) & 255,
-      currentNum & 255
-    ].join('.');
-    if (isValidIPv4(ip)) ips.push(ip);
+  try {
+    const [ip, mask] = cidr.split('/');
+    const maskNum = parseInt(mask, 10);
+    
+    // 只处理/24网段
+    if (maskNum !== 24) return [];
+    
+    const parts = ip.split('.');
+    if (parts.length !== 4) return [];
+    
+    const base = `${parts[0]}.${parts[1]}.${parts[2]}`;
+    const ips = [];
+    
+    // 生成256个IP
+    for (let i = 0; i <= 255; i++) {
+      const newIp = `${base}.${i}`;
+      const nums = newIp.split('.').map(Number);
+      let valid = true;
+      for (const num of nums) {
+        if (isNaN(num) || num < 0 || num > 255) {
+          valid = false;
+          break;
+        }
+      }
+      if (valid) {
+        ips.push(newIp);
+      }
+    }
+    
+    return ips;
+  } catch (e) {
+    return [];
   }
-  return ips;
 }
 
 function compareIPs(a, b) {
@@ -188,59 +200,60 @@ async function initDatabase(env) {
         try {
           await env.DB.prepare(stmt).run();
         } catch (e) {
-          console.log('执行语句失败（可能已存在）:', e.message);
+          console.log('执行语句失败:', e.message);
         }
       }
     }
-    console.log('✅ D1数据库初始化完成');
     return true;
   } catch (e) {
-    console.error('❌ D1数据库初始化失败:', e);
+    console.error('数据库初始化失败:', e);
     return false;
   }
 }
 
-// ========== 添加系统日志（D1）==========
+// ========== 添加系统日志 ==========
 async function addSystemLog(env, message) {
   try {
-    const timeStr = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+    const now = new Date();
+    const timeStr = now.toLocaleTimeString('zh-CN', { 
+      hour12: false,
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit'
+    });
+    
     await env.DB.prepare(
       'INSERT INTO system_logs (time_str, message) VALUES (?, ?)'
     ).bind(timeStr, message).run();
-    
-    // 清理7天前的日志
-    try {
-      await env.DB.exec("DELETE FROM system_logs WHERE time < datetime('now', '-7 days')");
-    } catch (e) {
-      // 忽略清理失败
-    }
   } catch (e) {
     console.error('添加日志失败:', e.message);
   }
 }
 
-// ========== 获取系统日志（D1）==========
+// ========== 获取系统日志 ==========
 async function getSystemLogs(env) {
   try {
     const result = await env.DB.prepare(
       'SELECT time_str, message FROM system_logs ORDER BY time DESC LIMIT 100'
     ).all();
     
-    return result.results.map(row => ({
-      timeStr: row.time_str,
-      message: row.message
+    return (result.results || []).map(row => ({
+      timeStr: row.time_str || new Date().toLocaleTimeString(),
+      message: row.message || ''
     }));
   } catch (e) {
-    console.error('获取日志失败:', e);
     return [];
   }
 }
 
-// ========== 更新优质池（D1）==========
+// ========== 更新优质池 - 只保存≤90ms的IP ==========
 async function updateHighQualityPool(env, ip, latency) {
   const config = getEnvConfig(env);
   
-  if (latency > QUALITY_LEVELS.ONE_STAR) return;
+  // 只保存 ≤90ms 的IP（三星及以上）
+  if (latency > QUALITY_LEVELS.THREE_STAR) {
+    return;
+  }
   
   const starLevel = getStarLevel(latency);
   
@@ -250,40 +263,40 @@ async function updateHighQualityPool(env, ip, latency) {
        VALUES (?, ?, ?, CURRENT_TIMESTAMP)`
     ).bind(ip, latency, starLevel).run();
     
+    // 限制优质池大小
     const countResult = await env.DB.prepare('SELECT COUNT(*) as count FROM high_quality_ips').first();
     const currentCount = countResult.count;
     
     if (currentCount > config.maxHighQualityPoolSize) {
       await env.DB.prepare(
         `DELETE FROM high_quality_ips 
-         WHERE ip NOT IN (
+         WHERE ip IN (
            SELECT ip FROM high_quality_ips 
-           ORDER BY latency ASC 
+           ORDER BY latency DESC 
            LIMIT ?
          )`
-      ).bind(config.maxHighQualityPoolSize).run();
-      
-      await addSystemLog(env, `📊 优质池已优化，保留 ${config.maxHighQualityPoolSize} 个最快IP`);
+      ).bind(currentCount - config.maxHighQualityPoolSize).run();
     }
   } catch (e) {
     console.error('更新优质池失败:', e);
   }
 }
 
-// ========== 获取优质池（D1）==========
+// ========== 获取优质池（只返回≤90ms的IP）==========
 async function getHighQualityIPs(env) {
   try {
     const result = await env.DB.prepare(
-      'SELECT ip, latency, star_level FROM high_quality_ips ORDER BY latency ASC'
-    ).all();
-    return result.results;
+      `SELECT ip, latency, star_level FROM high_quality_ips 
+       WHERE latency <= ? 
+       ORDER BY latency ASC`
+    ).bind(QUALITY_LEVELS.THREE_STAR).all();
+    return result.results || [];
   } catch (e) {
-    console.error('获取优质池失败:', e);
     return [];
   }
 }
 
-// ========== 添加失败IP（D1）==========
+// ========== 添加失败IP ==========
 async function addFailedIP(env, ip) {
   try {
     await env.DB.prepare(
@@ -291,24 +304,8 @@ async function addFailedIP(env, ip) {
     ).bind(ip).run();
     
     await env.DB.prepare('DELETE FROM high_quality_ips WHERE ip = ?').bind(ip).run();
-    
-    await addSystemLog(env, `⛔ ${ip} 加入失败黑名单（冷却15天）`);
   } catch (e) {
     console.error('添加失败IP失败:', e);
-  }
-}
-
-// ========== 检查IP是否在失败池中 ==========
-async function isIPFailed(env, ip) {
-  try {
-    const result = await env.DB.prepare(
-      'SELECT failed_at FROM failed_ips WHERE ip = ? AND failed_at > datetime("now", ?)'
-    ).bind(ip, `-${getEnvConfig(env).failedIpCooldownDays} days`).first();
-    
-    return !!result;
-  } catch (e) {
-    console.error('检查失败IP失败:', e);
-    return false;
   }
 }
 
@@ -316,9 +313,9 @@ async function isIPFailed(env, ip) {
 async function getFailedIPCount(env) {
   try {
     const result = await env.DB.prepare(
-      'SELECT COUNT(*) as count FROM failed_ips WHERE failed_at > datetime("now", "-15 days")'
+      'SELECT COUNT(*) as count FROM failed_ips'
     ).first();
-    return result.count || 0;
+    return result ? result.count : 0;
   } catch (e) {
     return 0;
   }
@@ -334,19 +331,18 @@ async function getTotalIPCount(env) {
   }
 }
 
-// ========== 获取所有IP（包含自定义）==========
+// ========== 获取所有IP ==========
 async function getAllIPs(env) {
   try {
     const ips = await env.KV.get(CONFIG.kvKeys.ipList, 'json') || [];
     const customIPs = await env.KV.get(CONFIG.kvKeys.customIPs, 'json') || [];
     return [...new Set([...ips, ...customIPs])];
   } catch (e) {
-    console.error('获取所有IP失败:', e);
     return [];
   }
 }
 
-// ========== 保存测速结果（D1）==========
+// ========== 保存测速结果 ==========
 async function saveSpeedResult(env, ip, latency, testCount) {
   try {
     await env.DB.prepare(
@@ -355,21 +351,6 @@ async function saveSpeedResult(env, ip, latency, testCount) {
     ).bind(ip, latency, testCount).run();
   } catch (e) {
     console.error('保存测速结果失败:', e);
-  }
-}
-
-// ========== 获取测速结果（D1）==========
-async function getSpeedResults(env) {
-  try {
-    const result = await env.DB.prepare('SELECT ip, delay FROM speed_results').all();
-    const speeds = {};
-    for (const row of result.results) {
-      speeds[row.ip] = { delay: row.delay };
-    }
-    return speeds;
-  } catch (e) {
-    console.error('获取测速结果失败:', e);
-    return {};
   }
 }
 
@@ -441,13 +422,14 @@ async function speedTest(env, ip) {
           successCount++;
         }
       } catch (e) {
-        // 单次失败继续尝试
+        // 忽略单次失败
       }
     }
     
     if (successCount === 0) {
       await addFailedIP(env, ip);
-      return { success: false, ip, error: '全部测速失败' };
+      await addSystemLog(env, `❌ ${ip} - 测速失败（加入黑名单）`);
+      return { success: false, ip };
     }
     
     const avgLatency = Math.round(totalLatency / successCount);
@@ -455,14 +437,18 @@ async function speedTest(env, ip) {
     await saveSpeedResult(env, ip, avgLatency, successCount);
     await updateHighQualityPool(env, ip, avgLatency);
     
+    const starLevel = getStarLevel(avgLatency);
+    await addSystemLog(env, `✅ ${ip} - ${avgLatency}ms ${starLevel}`);
+    
     return { 
       success: true, 
       ip, 
       latency: avgLatency, 
-      starLevel: getStarLevel(avgLatency) 
+      starLevel 
     };
   } catch (error) {
-    return { success: false, ip, error: error.message };
+    await addSystemLog(env, `❌ ${ip} - 测速异常`);
+    return { success: false, ip };
   }
 }
 
@@ -477,10 +463,7 @@ async function updateDNSBatch(env, ips) {
     const url = `https://api.cloudflare.com/client/v4/zones/${dnsConfig.zoneId}/dns_records`;
     
     const listResp = await fetch(`${url}?type=A&name=${dnsConfig.recordName}`, {
-      headers: {
-        'Authorization': `Bearer ${dnsConfig.apiToken}`,
-        'Content-Type': 'application/json'
-      }
+      headers: { 'Authorization': `Bearer ${dnsConfig.apiToken}` }
     });
     
     const listData = await listResp.json();
@@ -489,45 +472,35 @@ async function updateDNSBatch(env, ips) {
       for (const record of listData.result) {
         await fetch(`${url}/${record.id}`, {
           method: 'DELETE',
-          headers: {
-            'Authorization': `Bearer ${dnsConfig.apiToken}`
-          }
+          headers: { 'Authorization': `Bearer ${dnsConfig.apiToken}` }
         });
       }
     }
     
     let successCount = 0;
-    let createdIPs = [];
-    
     for (const ip of ips) {
-      const dnsData = {
-        type: 'A',
-        name: dnsConfig.recordName,
-        content: ip,
-        ttl: 120,
-        proxied: dnsConfig.proxied || false
-      };
-      
       const createResp = await fetch(url, {
         method: 'POST',
         headers: {
           'Authorization': `Bearer ${dnsConfig.apiToken}`,
           'Content-Type': 'application/json'
         },
-        body: JSON.stringify(dnsData)
+        body: JSON.stringify({
+          type: 'A',
+          name: dnsConfig.recordName,
+          content: ip,
+          ttl: 120,
+          proxied: dnsConfig.proxied || false
+        })
       });
       
       const result = await createResp.json();
-      if (result.success) {
-        successCount++;
-        createdIPs.push(ip);
-      }
+      if (result.success) successCount++;
     }
     
-    return { success: successCount > 0, count: successCount, ips: createdIPs };
+    return { success: successCount > 0, count: successCount };
   } catch (e) {
-    console.log('DNS更新失败:', e);
-    return { success: false, count: 0, ips: [] };
+    return { success: false, error: e.message, count: 0 };
   }
 }
 
@@ -535,6 +508,54 @@ async function updateDNSBatch(env, ips) {
 async function getBestIPs(env, count) {
   const highQualityIPs = await getHighQualityIPs(env);
   return highQualityIPs.slice(0, count).map(item => item.ip);
+}
+
+// ========== 检查优质池是否需要补充 ==========
+async function checkAndRefillHighQualityPool(env) {
+  try {
+    // 获取当前优质池数量（≤90ms）
+    const countResult = await env.DB.prepare(
+      'SELECT COUNT(*) as count FROM high_quality_ips WHERE latency <= ?'
+    ).bind(QUALITY_LEVELS.THREE_STAR).first();
+    const currentCount = countResult.count;
+    
+    // 如果优质池数量不足30个
+    if (currentCount < 30) {
+      await addSystemLog(env, `🔍 优质池数量不足 (${currentCount}/30)，开始补充`);
+      
+      // 获取总IP库
+      const allIPs = await getAllIPs(env);
+      
+      // 获取已存在的优质IP
+      const existingResult = await env.DB.prepare(
+        'SELECT ip FROM high_quality_ips'
+      ).all();
+      const existingSet = new Set(existingResult.results.map(row => row.ip));
+      
+      // 找出未测速的IP
+      const untestedIPs = allIPs.filter(ip => !existingSet.has(ip));
+      
+      // 随机选择50个未测速的IP
+      const ipsToTest = untestedIPs.sort(() => 0.5 - Math.random()).slice(0, 50);
+      
+      if (ipsToTest.length > 0) {
+        await addSystemLog(env, `📊 开始补充测速 ${ipsToTest.length} 个IP`);
+        
+        // 串行测速
+        for (const ip of ipsToTest) {
+          await speedTest(env, ip);
+        }
+        
+        const newCountResult = await env.DB.prepare(
+          'SELECT COUNT(*) as count FROM high_quality_ips WHERE latency <= ?'
+        ).bind(QUALITY_LEVELS.THREE_STAR).first();
+        
+        await addSystemLog(env, `✅ 补充测速完成，优质池现有 ${newCountResult.count} 个IP`);
+      }
+    }
+  } catch (e) {
+    console.error('检查优质池失败:', e);
+  }
 }
 
 // ========== 处理登录 ==========
@@ -553,7 +574,7 @@ async function handleLogin(request, env) {
     if (password === config.adminPassword) {
       const sessionId = generateSessionId();
       const sessions = await env.KV.get(CONFIG.kvKeys.sessions, 'json') || {};
-      sessions[sessionId] = { createdAt: Date.now(), expiresAt: Date.now() + 86400000 };
+      sessions[sessionId] = { createdAt: Date.now() };
       await env.KV.put(CONFIG.kvKeys.sessions, JSON.stringify(sessions));
       await addSystemLog(env, '🔐 管理员登录成功');
       
@@ -561,7 +582,6 @@ async function handleLogin(request, env) {
         headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
       });
     } else {
-      await addSystemLog(env, '⚠️ 管理员登录失败');
       return new Response(JSON.stringify({ success: false, error: '密码错误' }), {
         status: 401,
         headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
@@ -603,31 +623,32 @@ async function handleVisitorInfo(request, env) {
 // ========== 数据库状态检查 ==========
 async function handleDBStatus(env) {
   try {
+    await env.DB.prepare("SELECT 1").run();
+    
     const tables = await env.DB.prepare(
       "SELECT name FROM sqlite_master WHERE type='table'"
     ).all();
-    
-    const tableNames = tables.results.map(t => t.name);
     
     const counts = {};
     for (const table of ['speed_results', 'high_quality_ips', 'failed_ips', 'system_logs']) {
       try {
         const result = await env.DB.prepare(`SELECT COUNT(*) as count FROM ${table}`).first();
-        counts[table] = result.count;
+        counts[table] = result ? result.count : 0;
       } catch (e) {
-        counts[table] = -1;
+        counts[table] = 0;
       }
     }
     
     return {
       success: true,
-      tables: tableNames,
-      counts: counts,
-      initialized: tableNames.length >= 4
+      connected: true,
+      tables: tables.results.map(t => t.name),
+      counts
     };
   } catch (e) {
     return {
       success: false,
+      connected: false,
       error: e.message
     };
   }
@@ -637,11 +658,35 @@ async function handleDBStatus(env) {
 async function handleManualInit(env) {
   const success = await initDatabase(env);
   const status = await handleDBStatus(env);
-  
-  return {
-    success,
-    ...status
+  return { success, ...status };
+}
+
+// ========== 调试接口 ==========
+async function handleDebug(env) {
+  const debug = {
+    hasDB: !!env.DB,
+    hasKV: !!env.KV,
+    envKeys: Object.keys(env).filter(k => !k.startsWith('_')),
+    timestamp: new Date().toISOString(),
+    version: VERSION,
+    github: GITHUB_URL
   };
+  
+  if (env.DB) {
+    try {
+      await env.DB.prepare("SELECT 1").run();
+      debug.dbConnection = 'ok';
+      
+      const tables = await env.DB.prepare(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+      ).all();
+      debug.tables = tables.results.map(t => t.name);
+    } catch (e) {
+      debug.dbConnection = 'failed: ' + e.message;
+    }
+  }
+  
+  return debug;
 }
 
 // ========== 主逻辑 ==========
@@ -651,10 +696,8 @@ export default {
     const path = url.pathname;
     const config = getEnvConfig(env);
 
-    // 初始化数据库
-    ctx.waitUntil(initDatabase(env));
+    ctx.waitUntil(initDatabase(env).catch(() => {}));
 
-    // CORS 预检请求
     if (request.method === 'OPTIONS') {
       return new Response(null, {
         headers: {
@@ -665,7 +708,13 @@ export default {
       });
     }
 
-    // 公共接口
+    if (path === '/debug') {
+      const debug = await handleDebug(env);
+      return new Response(JSON.stringify(debug, null, 2), {
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
     if (path === '/login') {
       return new Response(getLoginHTML(), {
         headers: { 'Content-Type': 'text/html;charset=UTF-8' }
@@ -698,21 +747,17 @@ export default {
       });
     }
 
-    // 验证登录状态
     const sessionId = getSessionId(request);
     if (!await verifySession(sessionId, env)) {
-      if (path.startsWith('/api/') && path !== '/api/db-status') {
-        return new Response(JSON.stringify({ error: '未授权，请先登录' }), {
+      if (path.startsWith('/api/')) {
+        return new Response(JSON.stringify({ error: '未授权' }), {
           status: 401,
-          headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+          headers: { 'Content-Type': 'application/json' }
         });
       }
-      if (!path.startsWith('/api/')) {
-        return Response.redirect(`${url.origin}/login`, 302);
-      }
+      return Response.redirect(`${url.origin}/login`, 302);
     }
 
-    // 需要登录的接口
     if (path === '/') {
       return new Response(getMainHTML(env), {
         headers: { 'Content-Type': 'text/html;charset=UTF-8' }
@@ -725,49 +770,66 @@ export default {
 
     if (path === '/api/init-db' && request.method === 'POST') {
       const result = await handleManualInit(env);
-      if (result.success) {
-        await addSystemLog(env, '🗄️ 数据库手动初始化成功');
-      }
+      await addSystemLog(env, '🗄️ 数据库手动初始化成功');
       return new Response(JSON.stringify(result), {
-        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+        headers: { 'Content-Type': 'application/json' }
       });
     }
 
     if (path === '/api/get-logs') {
       const logs = await getSystemLogs(env);
       return new Response(JSON.stringify({ logs }), {
-        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+        headers: { 'Content-Type': 'application/json' }
       });
     }
 
     if (path === '/api/clear-logs' && request.method === 'POST') {
-      await env.DB.exec('DELETE FROM system_logs');
-      await addSystemLog(env, '📋 日志已被手动清除');
-      return new Response(JSON.stringify({ success: true }), {
-        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
-      });
+      try {
+        await env.DB.exec('DELETE FROM system_logs');
+        await addSystemLog(env, '📋 日志已被手动清除');
+        return new Response(JSON.stringify({ success: true }), {
+          headers: { 'Content-Type': 'application/json' }
+        });
+      } catch (e) {
+        return new Response(JSON.stringify({ success: false }), {
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
     }
 
     if (path === '/api/ips') {
-      const totalCount = await getTotalIPCount(env);
-      const highQualityIPs = await getHighQualityIPs(env);
-      const speeds = await getSpeedResults(env);
-      const lastUpdate = await env.KV.get(CONFIG.kvKeys.lastUpdate) || '--';
-      const failedCount = await getFailedIPCount(env);
-      const customIPs = await env.KV.get(CONFIG.kvKeys.customIPs, 'json') || [];
-      const allIPs = await getAllIPs(env);
-      
-      return new Response(JSON.stringify({ 
-        totalCount,
-        highQualityIPs, 
-        speeds, 
-        lastUpdate, 
-        failedCount,
-        customIPs,
-        allIPs
-      }), {
-        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
-      });
+      try {
+        const [totalCount, highQualityIPs, lastUpdate, failedCount, customIPs, allIPs] = await Promise.all([
+          getTotalIPCount(env).catch(() => 0),
+          getHighQualityIPs(env).catch(() => []),
+          env.KV.get(CONFIG.kvKeys.lastUpdate).catch(() => '--'),
+          getFailedIPCount(env).catch(() => 0),
+          env.KV.get(CONFIG.kvKeys.customIPs, 'json').catch(() => []),
+          getAllIPs(env).catch(() => [])
+        ]);
+        
+        return new Response(JSON.stringify({ 
+          totalCount: totalCount || 0,
+          highQualityIPs: highQualityIPs || [], 
+          lastUpdate: lastUpdate || '--', 
+          failedCount: failedCount || 0,
+          customIPs: customIPs || [],
+          allIPs: allIPs || []
+        }), {
+          headers: { 'Content-Type': 'application/json' }
+        });
+      } catch (e) {
+        return new Response(JSON.stringify({ 
+          totalCount: 0,
+          highQualityIPs: [], 
+          lastUpdate: '--', 
+          failedCount: 0,
+          customIPs: [],
+          allIPs: []
+        }), {
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
     }
 
     if (path === '/api/get-ui-config') {
@@ -777,41 +839,32 @@ export default {
         testCount: savedConfig.testCount || config.defaultTestCount,
         threadCount: savedConfig.threadCount || config.defaultThreadCount
       }), {
-        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+        headers: { 'Content-Type': 'application/json' }
       });
     }
 
     if (path === '/api/save-ui-config' && request.method === 'POST') {
       const { ipCount, testCount, threadCount } = await request.json();
-      const validIpCount = Math.min(5, Math.max(1, parseInt(ipCount) || config.defaultIpCount));
+      const validIpCount = Math.min(10, Math.max(1, parseInt(ipCount) || config.defaultIpCount));
       const validTestCount = Math.min(1000, Math.max(1, parseInt(testCount) || config.defaultTestCount));
       const validThreadCount = Math.min(50, Math.max(1, parseInt(threadCount) || config.defaultThreadCount));
       
-      const uiConfig = { 
-        ipCount: validIpCount, 
-        testCount: validTestCount, 
-        threadCount: validThreadCount 
-      };
-      
+      const uiConfig = { ipCount: validIpCount, testCount: validTestCount, threadCount: validThreadCount };
       await env.KV.put(CONFIG.kvKeys.uiConfig, JSON.stringify(uiConfig));
       await addSystemLog(env, `⚙️ 参数已保存: IP数量=${validIpCount}, 测速数量=${validTestCount}, 线程数=${validThreadCount}`);
       
       return new Response(JSON.stringify({ success: true, config: uiConfig }), {
-        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+        headers: { 'Content-Type': 'application/json' }
       });
     }
 
     if (path === '/api/get-config') {
       const dnsConfig = await env.KV.get(CONFIG.kvKeys.dnsConfig, 'json') || {
-        apiToken: '', zoneId: '', recordName: '', proxied: true, autoUpdate: false
+        apiToken: '', zoneId: '', recordName: '', proxied: true, autoUpdate: false,
+        autoUpdateAfterTest: false
       };
-      const maskedConfig = {
-        ...dnsConfig,
-        apiToken: dnsConfig.apiToken ? '********' : '',
-        zoneId: dnsConfig.zoneId ? '********' : ''
-      };
-      return new Response(JSON.stringify(maskedConfig), {
-        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+      return new Response(JSON.stringify(dnsConfig), {
+        headers: { 'Content-Type': 'application/json' }
       });
     }
 
@@ -820,14 +873,13 @@ export default {
       await env.KV.put(CONFIG.kvKeys.dnsConfig, JSON.stringify(dnsConfig));
       await addSystemLog(env, '🔐 DNS配置已保存');
       return new Response(JSON.stringify({ success: true }), {
-        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+        headers: { 'Content-Type': 'application/json' }
       });
     }
 
     if (path === '/api/save-custom-ips' && request.method === 'POST') {
       const { ips } = await request.json();
       const validIPs = [];
-      const invalidIPs = [];
       const expandedIPs = [];
       
       for (const item of ips) {
@@ -839,11 +891,7 @@ export default {
           if (cidrIPs.length > 0) {
             expandedIPs.push(...cidrIPs);
             validIPs.push(item);
-          } else {
-            invalidIPs.push(item);
           }
-        } else {
-          invalidIPs.push(item);
         }
       }
       
@@ -859,12 +907,10 @@ export default {
       
       return new Response(JSON.stringify({ 
         success: true, 
-        validCount: validIPs.length,
         expandedCount: expandedIPs.length,
-        invalidCount: invalidIPs.length,
-        invalidIPs
+        validCount: validIPs.length 
       }), {
-        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+        headers: { 'Content-Type': 'application/json' }
       });
     }
 
@@ -872,7 +918,7 @@ export default {
       await env.KV.put(CONFIG.kvKeys.customIPs, JSON.stringify([]));
       await addSystemLog(env, '🗑️ 所有自定义IP已清除');
       return new Response(JSON.stringify({ success: true }), {
-        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+        headers: { 'Content-Type': 'application/json' }
       });
     }
 
@@ -880,22 +926,19 @@ export default {
       ctx.waitUntil(updateIPs(env));
       await addSystemLog(env, '🔄 手动触发IP列表更新');
       return new Response(JSON.stringify({ status: '更新任务已启动' }), {
-        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+        headers: { 'Content-Type': 'application/json' }
       });
     }
 
     if (path === '/api/speedtest' && request.method === 'GET') {
       const ip = url.searchParams.get('ip');
       if (!ip) {
-        return new Response(JSON.stringify({ error: '缺少IP参数' }), { 
-          status: 400,
-          headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
-        });
+        return new Response(JSON.stringify({ error: '缺少IP参数' }), { status: 400 });
       }
       
       const result = await speedTest(env, ip);
       return new Response(JSON.stringify(result), {
-        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+        headers: { 'Content-Type': 'application/json' }
       });
     }
 
@@ -910,19 +953,18 @@ export default {
       }
       
       if (!targetIPs || targetIPs.length === 0) {
-        return new Response(JSON.stringify({ error: '无可用IP' }), { 
-          status: 400,
-          headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
-        });
+        return new Response(JSON.stringify({ error: '无可用IP' }), { status: 400 });
       }
       
       const result = await updateDNSBatch(env, targetIPs);
       if (result.success) {
         await addSystemLog(env, `✅ DNS更新成功: ${result.count} 个IP`);
+      } else {
+        await addSystemLog(env, `❌ DNS更新失败: ${result.error || '未知错误'}`);
       }
       
       return new Response(JSON.stringify(result), {
-        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+        headers: { 'Content-Type': 'application/json' }
       });
     }
 
@@ -932,11 +974,15 @@ export default {
   async scheduled(event, env, ctx) {
     await initDatabase(env);
     await addSystemLog(env, '⏰ Cron定时任务启动');
+    
+    // 更新IP列表
     await updateIPs(env);
+    
+    // 检查并补充优质池
+    await checkAndRefillHighQualityPool(env);
     
     const dnsConfig = await env.KV.get(CONFIG.kvKeys.dnsConfig, 'json');
     if (dnsConfig?.autoUpdate) {
-      await addSystemLog(env, '🤖 自动更新DNS已开启');
       const config = getEnvConfig(env);
       const uiConfig = await env.KV.get(CONFIG.kvKeys.uiConfig, 'json') || {};
       const ipCount = uiConfig.ipCount || config.defaultIpCount;
@@ -946,11 +992,7 @@ export default {
         const result = await updateDNSBatch(env, bestIPs);
         if (result.success) {
           await addSystemLog(env, `✅ Cron自动更新DNS成功: ${result.count} 个IP`);
-        } else {
-          await addSystemLog(env, '❌ Cron自动更新DNS失败');
         }
-      } else {
-        await addSystemLog(env, '⚠️ Cron无可用的IP');
       }
     }
     
@@ -958,7 +1000,7 @@ export default {
   }
 };
 
-// ========== HTML页面 ==========
+// ========== 登录页面 ==========
 function getLoginHTML() {
   return `<!DOCTYPE html>
 <html>
@@ -1085,6 +1127,7 @@ function getLoginHTML() {
 </html>`;
 }
 
+// ========== 主页面（GitHub按钮在右上角）=========
 function getMainHTML(env) {
   const config = {
     defaultIpCount: env.DEFAULT_IP_COUNT ? parseInt(env.DEFAULT_IP_COUNT) : 3,
@@ -1096,7 +1139,7 @@ function getMainHTML(env) {
 <html>
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale-1.0">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>CF优选IP · 智能优选</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -1120,16 +1163,37 @@ function getMainHTML(env) {
       -webkit-background-clip: text;
       -webkit-text-fill-color: transparent;
     }
-    .header-right { display: flex; gap: 12px; align-items: center; }
+    .header-right {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+    .github-btn {
+      background: #1e293b;
+      color: #94a3b8;
+      text-decoration: none;
+      padding: 6px 12px;
+      border-radius: 20px;
+      font-size: 13px;
+      border: 1px solid #334155;
+      transition: 0.2s;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .github-btn:hover {
+      color: #60a5fa;
+      border-color: #60a5fa;
+      background: #0f172a;
+    }
     .visitor-info {
       background: #1e293b;
-      padding: 8px 16px;
+      padding: 6px 12px;
       border-radius: 20px;
       font-size: 13px;
       border: 1px solid #334155;
       color: #94a3b8;
     }
-    .visitor-info strong { color: #60a5fa; }
     .badge {
       background: #1e293b;
       padding: 6px 12px;
@@ -1146,6 +1210,10 @@ function getMainHTML(env) {
       padding: 6px 16px;
       font-size: 13px;
       cursor: pointer;
+      transition: 0.2s;
+    }
+    .logout-btn:hover {
+      background: #6b7280;
     }
     .grid {
       display: grid;
@@ -1168,12 +1236,13 @@ function getMainHTML(env) {
     }
     .card-header h2 { font-size: 16px; font-weight: 500; color: #f1f5f9; }
     .card-body { padding: 20px; }
-    .stats {
+    
+    .stats-row {
       display: flex;
       gap: 16px;
       margin-bottom: 20px;
     }
-    .stat-item {
+    .stat-card {
       flex: 1;
       background: #0f172a;
       padding: 16px;
@@ -1190,6 +1259,7 @@ function getMainHTML(env) {
       font-weight: 600;
       color: #60a5fa;
     }
+    
     .search-box {
       width: 100%;
       padding: 10px 12px;
@@ -1200,12 +1270,15 @@ function getMainHTML(env) {
       font-size: 14px;
       margin-bottom: 16px;
     }
+    
     .table-container {
-      max-height: 350px;
+      max-height: 300px;
       overflow-y: auto;
       border: 1px solid #334155;
       border-radius: 8px;
+      margin-bottom: 20px;
     }
+    
     table {
       width: 100%;
       border-collapse: collapse;
@@ -1229,16 +1302,51 @@ function getMainHTML(env) {
       color: #60a5fa;
     }
     .delay-good { color: #4ade80; }
-    .delay-ok { color: #fbbf24; }
-    .delay-bad { color: #f87171; }
+    
+    .custom-ip-section {
+      background: #0f172a;
+      border-radius: 8px;
+      padding: 16px;
+      margin-top: 20px;
+    }
+    .custom-ip-title {
+      color: #60a5fa;
+      font-size: 14px;
+      margin-bottom: 12px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .custom-ip-textarea {
+      width: 100%;
+      padding: 12px;
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 8px;
+      color: #f1f5f9;
+      font-size: 13px;
+      font-family: monospace;
+      min-height: 80px;
+      resize: vertical;
+      margin-bottom: 12px;
+    }
+    .custom-ip-actions {
+      display: flex;
+      gap: 8px;
+    }
+    
     .btn {
-      padding: 6px 12px;
+      padding: 8px 16px;
       border: none;
       border-radius: 6px;
-      font-size: 12px;
+      font-size: 13px;
       font-weight: 500;
       cursor: pointer;
       transition: 0.2s;
+    }
+    .btn-sm {
+      padding: 4px 12px;
+      font-size: 12px;
     }
     .btn-primary { background: #2563eb; color: white; }
     .btn-primary:hover { background: #1d4ed8; }
@@ -1250,10 +1358,7 @@ function getMainHTML(env) {
     .btn-warning:hover { background: #b45309; }
     .btn-danger { background: #b91c1c; color: white; }
     .btn-danger:hover { background: #991b1b; }
-    .btn-sm {
-      padding: 4px 8px;
-      font-size: 11px;
-    }
+    
     .form-group { margin-bottom: 16px; }
     .form-group label {
       display: block;
@@ -1261,7 +1366,7 @@ function getMainHTML(env) {
       color: #94a3b8;
       margin-bottom: 4px;
     }
-    .form-group input, .form-group select, .form-group textarea {
+    .form-group input, .form-group select {
       width: 100%;
       padding: 10px 12px;
       background: #0f172a;
@@ -1270,28 +1375,21 @@ function getMainHTML(env) {
       color: #f1f5f9;
       font-size: 14px;
     }
-    .form-group input:focus, .form-group textarea:focus {
-      outline: none;
-      border-color: #60a5fa;
-    }
-    .form-group textarea {
-      font-family: monospace;
-      min-height: 80px;
-      resize: vertical;
-    }
+    
     .checkbox {
       display: flex;
       align-items: center;
       gap: 8px;
+      margin-bottom: 8px;
     }
-    .checkbox input { width: auto; }
+    
     .log-panel {
       background: #0f172a;
       border-radius: 8px;
       padding: 12px;
       font-family: monospace;
       font-size: 12px;
-      height: 250px;
+      height: 200px;
       overflow-y: auto;
       border: 1px solid #334155;
       margin: 16px 0;
@@ -1301,13 +1399,12 @@ function getMainHTML(env) {
       margin-bottom: 6px;
       border-bottom: 1px solid #1e293b;
       padding-bottom: 4px;
-      font-size: 12px;
     }
     .log-time {
       color: #60a5fa;
       margin-right: 8px;
-      font-weight: 500;
     }
+    
     .progress-bar {
       height: 4px;
       background: #334155;
@@ -1341,14 +1438,6 @@ function getMainHTML(env) {
       color: #94a3b8;
       margin-bottom: 4px;
     }
-    .param-value {
-      background: #0f172a;
-      padding: 10px 12px;
-      border-radius: 8px;
-      border: 1px solid #334155;
-      font-size: 14px;
-      color: #f1f5f9;
-    }
     .param-input {
       width: 100%;
       padding: 10px 12px;
@@ -1369,23 +1458,38 @@ function getMainHTML(env) {
       border-top: 1px solid #334155;
       margin: 20px 0;
     }
-    .db-status {
+    
+    .db-status-card {
       background: #0f172a;
       border-radius: 8px;
-      padding: 12px;
-      margin-bottom: 16px;
-      font-size: 12px;
+      padding: 16px;
+      margin-bottom: 20px;
       border-left: 4px solid #60a5fa;
-      display: none;
     }
-    .db-status.ok { border-left-color: #4ade80; }
-    .db-status.error { border-left-color: #f87171; }
+    .db-status-card.ok { border-left-color: #4ade80; }
+    .db-status-card.error { border-left-color: #f87171; }
+    .db-status-title {
+      font-size: 13px;
+      color: #94a3b8;
+      margin-bottom: 8px;
+    }
+    .db-status-content {
+      font-size: 13px;
+      color: #f1f5f9;
+      line-height: 1.5;
+    }
+    
     .auto-refresh-toggle {
       display: flex;
       align-items: center;
       gap: 8px;
       font-size: 12px;
       color: #94a3b8;
+    }
+    .version-text {
+      font-size: 10px;
+      color: #4b5563;
+      margin-left: 4px;
     }
   </style>
 </head>
@@ -1394,37 +1498,36 @@ function getMainHTML(env) {
     <div class="header">
       <h1>🌩️ CF优选IP · 智能优选</h1>
       <div class="header-right">
+        <a href="${GITHUB_URL}" target="_blank" class="github-btn">⭐ GitHub</a>
         <span class="visitor-info" id="visitorInfo">加载中...</span>
         <span class="badge" id="lastUpdateBadge">加载中...</span>
         <button class="logout-btn" onclick="logout()">登出</button>
       </div>
     </div>
 
-    <!-- 数据库状态提示 -->
-    <div class="db-status" id="dbStatus"></div>
-
     <div class="grid">
-      <!-- 左侧：测速IP列表 + 日志 -->
+      <!-- 左侧 -->
       <div>
         <div class="card">
           <div class="card-header">
-            <h2>📋 测速IP列表</h2>
+            <h2>📋 优质IP列表 (≤90ms) <span class="version-text">${VERSION}</span></h2>
             <div>
-              <button class="btn btn-sm btn-primary" onclick="manualUpdate()">刷新</button>
-              <button class="btn btn-sm btn-warning" onclick="startSpeedTest()" id="speedTestBtn">测速</button>
+              <button class="btn btn-sm btn-primary" onclick="manualUpdate()">刷新IP列表</button>
+              <button class="btn btn-sm btn-warning" onclick="startSpeedTest()" id="speedTestBtn">开始测速</button>
+              <button class="btn btn-sm btn-success" onclick="exportHighQualityIPs()">导出优质IP</button>
             </div>
           </div>
           <div class="card-body">
-            <div class="stats">
-              <div class="stat-item">
-                <div class="stat-label">总IP</div>
+            <div class="stats-row">
+              <div class="stat-card">
+                <div class="stat-label">总IP池</div>
                 <div class="stat-value" id="totalCount">0</div>
               </div>
-              <div class="stat-item">
+              <div class="stat-card">
                 <div class="stat-label">优质池</div>
                 <div class="stat-value" id="highQualityCount">0</div>
               </div>
-              <div class="stat-item">
+              <div class="stat-card">
                 <div class="stat-label">失败池</div>
                 <div class="stat-value" id="failedCount">0</div>
               </div>
@@ -1435,7 +1538,7 @@ function getMainHTML(env) {
             </div>
             <div class="speed-status" id="speedStatus"></div>
 
-            <input type="text" class="search-box" id="search" placeholder="🔍 搜索IP...">
+            <input type="text" class="search-box" id="search" placeholder="🔍 搜索优质IP...">
 
             <div class="table-container">
               <table>
@@ -1448,9 +1551,21 @@ function getMainHTML(env) {
                   </tr>
                 </thead>
                 <tbody id="ipTable">
-                  <tr><td colspan="4" style="text-align: center; padding: 30px;">暂无测速数据，请点击"测速"开始</td></tr>
+                  <tr><td colspan="4" style="text-align: center; padding: 30px;">暂无优质IP，请点击"开始测速"</td></tr>
                 </tbody>
               </table>
+            </div>
+
+            <div class="custom-ip-section">
+              <div class="custom-ip-title">
+                <span>📥 自定义IP/CIDR</span>
+                <span style="color: #94a3b8; font-size: 12px;">每行一个 (支持/24网段)</span>
+              </div>
+              <textarea class="custom-ip-textarea" id="customIPs" placeholder="例如：&#10;1.1.1.1&#10;162.159.38.0/24"></textarea>
+              <div class="custom-ip-actions">
+                <button class="btn btn-sm btn-success" style="flex: 1;" onclick="saveCustomIPs()">保存</button>
+                <button class="btn btn-sm btn-danger" style="flex: 1;" onclick="clearCustomIPs()">清除</button>
+              </div>
             </div>
           </div>
         </div>
@@ -1475,27 +1590,30 @@ function getMainHTML(env) {
         </div>
       </div>
 
-      <!-- 右侧：配置面板 -->
+      <!-- 右侧 -->
       <div class="card">
         <div class="card-header">
           <h2>⚙️ 配置面板</h2>
         </div>
         <div class="card-body">
-          <!-- 数据库管理 -->
+          <div class="db-status-card" id="dbStatusCard" style="display: none;">
+            <div class="db-status-title">🗄️ 数据库状态</div>
+            <div class="db-status-content" id="dbStatusContent"></div>
+          </div>
+
           <div style="background: #0f172a; padding: 16px; border-radius: 8px; margin-bottom: 20px;">
             <h3 style="color: #60a5fa; font-size: 14px; margin-bottom: 12px;">🗄️ 数据库管理</h3>
             <button class="btn btn-success full-width" onclick="initDatabase()" id="initDbBtn">手动初始化数据库</button>
             <button class="btn btn-primary full-width" style="margin-top: 8px;" onclick="checkDBStatus()">检查数据库状态</button>
           </div>
 
-          <!-- 运行参数 -->
           <div style="background: #0f172a; padding: 16px; border-radius: 8px; margin-bottom: 20px;">
             <h3 style="color: #60a5fa; font-size: 14px; margin-bottom: 12px;">🔧 运行参数</h3>
             
             <div class="params-row">
               <div class="param-item">
-                <label>IP数量 <span style="color: #94a3b8;">(1-5)</span></label>
-                <input type="number" class="param-input" id="ipCount" min="1" max="5" value="${config.defaultIpCount}">
+                <label>IP数量 <span style="color: #94a3b8;">(1-10)</span></label>
+                <input type="number" class="param-input" id="ipCount" min="1" max="10" value="${config.defaultIpCount}">
               </div>
               
               <div class="param-item">
@@ -1510,13 +1628,12 @@ function getMainHTML(env) {
             </div>
             
             <div style="font-size: 12px; color: #94a3b8; margin-top: 8px; text-align: center;">
-              ⭐ 星级规则: ≤30ms(⭐⭐⭐⭐⭐), ≤60ms(⭐⭐⭐⭐), ≤90ms(⭐⭐⭐), ≤120ms(⭐⭐), ≤150ms(⭐)
+              ⭐ 优质IP标准: ≤90ms (⭐⭐⭐及以上)
             </div>
             
             <button class="btn btn-primary full-width" style="margin-top: 12px;" onclick="saveUIConfig()">保存参数</button>
           </div>
 
-          <!-- DNS配置 -->
           <h3 style="color: #60a5fa; font-size: 14px; margin-bottom: 12px;">📌 DNS配置</h3>
           <div class="form-group">
             <label>API Token</label>
@@ -1538,27 +1655,21 @@ function getMainHTML(env) {
               <option value="false">仅DNS (灰色云)</option>
             </select>
           </div>
+          
           <div class="checkbox">
             <input type="checkbox" id="autoUpdate">
             <label>每小时自动更新DNS</label>
+          </div>
+          
+          <!-- 新增：测速后自动更新DNS选项 -->
+          <div class="checkbox">
+            <input type="checkbox" id="autoUpdateDNSAfterTest">
+            <label>测速完成后自动更新DNS</label>
           </div>
 
           <div class="button-group">
             <button class="btn btn-success" style="flex: 1;" onclick="saveConfig()">保存DNS</button>
             <button class="btn btn-primary" style="flex: 1;" onclick="updateDNSWithBest()">立即更新</button>
-          </div>
-
-          <hr>
-
-          <!-- 自定义IP -->
-          <h3 style="color: #60a5fa; font-size: 14px; margin-bottom: 12px;">📥 自定义IP</h3>
-          <div class="form-group">
-            <textarea id="customIPs" placeholder="每行一个IP或CIDR&#10;1.1.1.1&#10;172.64.229.0/24"></textarea>
-          </div>
-          <div class="button-group">
-            <button class="btn btn-secondary" style="flex: 1;" onclick="loadCustomIPs()">加载</button>
-            <button class="btn btn-success" style="flex: 1;" onclick="saveCustomIPs()">保存</button>
-            <button class="btn btn-danger" style="flex: 1;" onclick="clearCustomIPs()">清除</button>
           </div>
         </div>
       </div>
@@ -1566,46 +1677,90 @@ function getMainHTML(env) {
   </div>
 
   <script>
-    let speeds = {};
-    let dnsConfig = {};
-    let isSpeedTesting = false;
-    let customIPs = [];
     let highQualityIPs = [];
-    let totalCount = 0;
-    let failedCount = 0;
     let allIPs = [];
     let uiConfig = {
       ipCount: ${config.defaultIpCount},
       testCount: ${config.defaultTestCount},
       threadCount: ${config.defaultThreadCount}
     };
+    let autoRefreshInterval = null;
+    let isSpeedTesting = false;
     let activeThreads = 0;
     let totalTested = 0;
     let totalToTest = 0;
     let testQueue = [];
-    let autoRefreshInterval = null;
-    let lastLogLength = 0;
 
     window.onload = async () => {
       if (await checkAuth()) {
-        await loadVisitorInfo();
-        await loadUIConfig();
-        await loadConfig();
-        await loadIPs();
-        await loadLogs();
-        await checkDBStatus();
-        startAutoRefresh(); // 启动自动刷新日志
+        await Promise.all([
+          loadVisitorInfo().catch(() => {}),
+          loadUIConfig().catch(() => {}),
+          loadConfig().catch(() => {}),
+          loadIPs().catch(() => {}),
+          loadLogs().catch(() => {}),
+          checkDBStatus().catch(() => {})
+        ]);
+        startAutoRefresh();
       }
     };
 
-    // 自动刷新日志
-    function startAutoRefresh() {
-      if (autoRefreshInterval) clearInterval(autoRefreshInterval);
-      autoRefreshInterval = setInterval(async () => {
-        if (document.getElementById('autoRefreshLogs').checked) {
-          await loadLogs();
+    async function checkAuth() {
+      try {
+        const res = await fetch('/api/check-auth');
+        const data = await res.json();
+        if (!data.authenticated) {
+          window.location.href = '/login';
+          return false;
         }
-      }, 3000); // 每3秒刷新一次
+        return true;
+      } catch {
+        window.location.href = '/login';
+        return false;
+      }
+    }
+
+    async function logout() {
+      await fetch('/api/logout', { method: 'POST' });
+      document.cookie = 'sessionId=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT';
+      window.location.href = '/login';
+    }
+
+    async function loadVisitorInfo() {
+      try {
+        const res = await fetch('/api/visitor-info');
+        const data = await res.json();
+        document.getElementById('visitorInfo').innerHTML = 
+          \`当前访问IP: \${data.clientIP} | \${data.countryName}\`;
+      } catch (e) {
+        document.getElementById('visitorInfo').innerHTML = '无法获取访客信息';
+      }
+    }
+
+    async function loadLogs() {
+      try {
+        const res = await fetch('/api/get-logs');
+        const data = await res.json();
+        const panel = document.getElementById('logPanel');
+        if (data.logs && data.logs.length) {
+          panel.innerHTML = data.logs.map(log => {
+            const timeStr = log.timeStr || new Date().toLocaleTimeString();
+            return \`<div class="log-entry"><span class="log-time">[\${timeStr}]</span> \${log.message}</div>\`;
+          }).join('');
+        }
+      } catch (e) {
+        console.error('加载日志失败:', e);
+      }
+    }
+
+    async function clearLogs() {
+      if (!confirm('清除所有日志？')) return;
+      await fetch('/api/clear-logs', { method: 'POST' });
+      await loadLogs();
+    }
+
+    async function refreshLogs() {
+      await loadLogs();
     }
 
     function toggleAutoRefresh() {
@@ -1619,137 +1774,63 @@ function getMainHTML(env) {
       }
     }
 
-    async function checkAuth() {
-      const res = await fetch('/api/check-auth');
-      const data = await res.json();
-      if (!data.authenticated) window.location.href = '/login';
-      return data.authenticated;
-    }
-
-    async function logout() {
-      await fetch('/api/logout', { method: 'POST' });
-      document.cookie = 'sessionId=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT';
-      window.location.href = '/login';
-    }
-
-    async function loadVisitorInfo() {
-      const res = await fetch('/api/visitor-info');
-      const data = await res.json();
-      document.getElementById('visitorInfo').innerHTML = 
-        \`当前访问IP: \${data.clientIP} | 访问地区: \${data.countryName}\`;
-    }
-
-    async function loadLogs() {
-      try {
-        const res = await fetch('/api/get-logs');
-        const data = await res.json();
-        renderLogs(data.logs || []);
-      } catch (e) {
-        console.error('加载日志失败:', e);
-      }
-    }
-
-    function renderLogs(logs) {
-      const panel = document.getElementById('logPanel');
-      if (!logs.length) {
-        if (lastLogLength !== 0) {
-          panel.innerHTML = '<div class="log-entry"><span class="log-time">[系统]</span> 暂无日志</div>';
-          lastLogLength = 0;
+    function startAutoRefresh() {
+      if (autoRefreshInterval) clearInterval(autoRefreshInterval);
+      autoRefreshInterval = setInterval(() => {
+        if (document.getElementById('autoRefreshLogs').checked) {
+          loadLogs();
         }
-        return;
-      }
-      
-      // 只有当日志变化时才更新DOM
-      const logsJson = JSON.stringify(logs);
-      if (logsJson !== lastLogLength) {
-        const recentLogs = logs.slice(0, 100); // 显示最新的100条
-        panel.innerHTML = recentLogs.map(log => 
-          \`<div class="log-entry"><span class="log-time">[\${log.timeStr}]</span> \${log.message}</div>\`
-        ).join('');
-        panel.scrollTop = 0; // 滚动到最新
-        lastLogLength = logsJson;
-      }
-    }
-
-    async function clearLogs() {
-      if (!confirm('清除所有日志？')) return;
-      await fetch('/api/clear-logs', { method: 'POST' });
-      await loadLogs();
-      addUILog('✅ 日志已清除');
-    }
-
-    async function refreshLogs() {
-      await loadLogs();
-      addUILog('🔄 日志已刷新');
-    }
-
-    function addUILog(msg) {
-      const panel = document.getElementById('logPanel');
-      const time = new Date().toLocaleTimeString('zh-CN', { hour12: false });
-      // 临时添加，下次刷新日志时会覆盖
-      panel.innerHTML = \`<div class="log-entry"><span class="log-time">[\${time}]</span> \${msg}</div>\` + panel.innerHTML;
+      }, 3000);
     }
 
     async function checkDBStatus() {
-      const statusDiv = document.getElementById('dbStatus');
       try {
         const res = await fetch('/api/db-status');
         const data = await res.json();
+        const card = document.getElementById('dbStatusCard');
+        const content = document.getElementById('dbStatusContent');
         
-        if (data.success) {
-          if (data.initialized) {
-            statusDiv.className = 'db-status ok';
-            statusDiv.innerHTML = \`✅ 数据库正常 | 表: \${data.tables.join(', ')} | 优质池: \${data.counts.high_quality_ips}个IP\`;
-          } else {
-            statusDiv.className = 'db-status error';
-            statusDiv.innerHTML = \`⚠️ 数据库未完全初始化 | 现有表: \${data.tables.join(', ')} | 缺少表: \${['speed_results', 'high_quality_ips', 'failed_ips', 'system_logs'].filter(t => !data.tables.includes(t)).join(', ')}\`;
-          }
+        if (data.connected) {
+          card.className = 'db-status-card ok';
+          content.innerHTML = \`✅ 数据库连接正常 | 优质池: \${data.counts?.high_quality_ips || 0}个IP\`;
         } else {
-          statusDiv.className = 'db-status error';
-          statusDiv.innerHTML = \`❌ 数据库连接失败: \${data.error}\`;
+          card.className = 'db-status-card error';
+          content.innerHTML = '❌ 数据库连接失败，请点击"手动初始化数据库"';
         }
-        statusDiv.style.display = 'block';
+        card.style.display = 'block';
       } catch (e) {
-        statusDiv.className = 'db-status error';
-        statusDiv.innerHTML = '❌ 无法检查数据库状态';
-        statusDiv.style.display = 'block';
+        console.error('检查数据库状态失败:', e);
       }
     }
 
     async function initDatabase() {
       const btn = document.getElementById('initDbBtn');
-      const originalText = btn.textContent;
-      
-      if (!confirm('确定要初始化数据库吗？如果表已存在不会覆盖。')) return;
-      
       btn.disabled = true;
       btn.textContent = '初始化中...';
       
       try {
-        const res = await fetch('/api/init-db', { method: 'POST' });
-        const data = await res.json();
-        
-        if (data.success) {
-          addUILog('✅ 数据库初始化成功');
-          await checkDBStatus();
-          await loadLogs();
-        } else {
-          addUILog('❌ 数据库初始化失败');
-        }
+        await fetch('/api/init-db', { method: 'POST' });
+        await checkDBStatus();
+        await loadLogs();
       } catch (e) {
-        addUILog('❌ 初始化请求失败');
-      } finally {
-        btn.disabled = false;
-        btn.textContent = originalText;
+        console.error('初始化失败:', e);
       }
+      
+      btn.disabled = false;
+      btn.textContent = '手动初始化数据库';
     }
 
     async function loadUIConfig() {
-      const res = await fetch('/api/get-ui-config');
-      uiConfig = await res.json();
-      document.getElementById('ipCount').value = uiConfig.ipCount;
-      document.getElementById('testCount').value = uiConfig.testCount;
-      document.getElementById('threadCount').value = uiConfig.threadCount;
+      try {
+        const res = await fetch('/api/get-ui-config');
+        const data = await res.json();
+        uiConfig = data;
+        document.getElementById('ipCount').value = data.ipCount;
+        document.getElementById('testCount').value = data.testCount;
+        document.getElementById('threadCount').value = data.threadCount;
+      } catch (e) {
+        console.error('加载配置失败:', e);
+      }
     }
 
     async function saveUIConfig() {
@@ -1757,40 +1838,30 @@ function getMainHTML(env) {
       const testCount = parseInt(document.getElementById('testCount').value) || 50;
       const threadCount = parseInt(document.getElementById('threadCount').value) || 10;
       
-      if (ipCount < 1 || ipCount > 5) {
-        alert('IP数量必须在1-5之间');
-        return;
-      }
-      if (testCount < 1 || testCount > 1000) {
-        alert('测速数量必须在1-1000之间');
-        return;
-      }
-      if (threadCount < 1 || threadCount > 50) {
-        alert('线程数必须在1-50之间');
-        return;
-      }
-      
-      const res = await fetch('/api/save-ui-config', {
+      await fetch('/api/save-ui-config', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ipCount, testCount, threadCount })
       });
-      const data = await res.json();
-      if (data.success) {
-        uiConfig = data.config;
-        addUILog(\`✅ 参数已保存: IP数量=\${ipCount}, 测速数量=\${testCount}, 线程数=\${threadCount}\`);
-        await loadLogs();
-      }
+      
+      uiConfig = { ipCount, testCount, threadCount };
+      await loadLogs();
     }
 
     async function loadConfig() {
-      const res = await fetch('/api/get-config');
-      dnsConfig = await res.json();
-      document.getElementById('apiToken').value = dnsConfig.apiToken || '';
-      document.getElementById('zoneId').value = dnsConfig.zoneId || '';
-      document.getElementById('recordName').value = dnsConfig.recordName || '';
-      document.getElementById('proxied').value = dnsConfig.proxied ? 'true' : 'false';
-      document.getElementById('autoUpdate').checked = dnsConfig.autoUpdate || false;
+      try {
+        const res = await fetch('/api/get-config');
+        const data = await res.json();
+        document.getElementById('apiToken').value = data.apiToken || '';
+        document.getElementById('zoneId').value = data.zoneId || '';
+        document.getElementById('recordName').value = data.recordName || '';
+        document.getElementById('proxied').value = data.proxied ? 'true' : 'false';
+        document.getElementById('autoUpdate').checked = data.autoUpdate || false;
+        // 新增：加载测速后自动更新DNS配置
+        document.getElementById('autoUpdateDNSAfterTest').checked = data.autoUpdateAfterTest || false;
+      } catch (e) {
+        console.error('加载DNS配置失败:', e);
+      }
     }
 
     async function saveConfig() {
@@ -1799,52 +1870,43 @@ function getMainHTML(env) {
         zoneId: document.getElementById('zoneId').value,
         recordName: document.getElementById('recordName').value,
         proxied: document.getElementById('proxied').value === 'true',
-        autoUpdate: document.getElementById('autoUpdate').checked
+        autoUpdate: document.getElementById('autoUpdate').checked,
+        // 新增：保存测速后自动更新DNS配置
+        autoUpdateAfterTest: document.getElementById('autoUpdateDNSAfterTest').checked
       };
 
-      const res = await fetch('/api/save-config', {
+      await fetch('/api/save-config', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(config)
       });
-      if (res.ok) {
-        dnsConfig = config;
-        addUILog('✅ DNS配置已保存');
-        await loadLogs();
-      }
-    }
-
-    async function loadCustomIPs() {
-      const res = await fetch('/api/ips');
-      const data = await res.json();
-      customIPs = data.customIPs || [];
-      highQualityIPs = data.highQualityIPs || [];
-      totalCount = data.totalCount || 0;
-      failedCount = data.failedCount || 0;
-      allIPs = data.allIPs || [];
-      document.getElementById('customIPs').value = customIPs.join('\\n');
-      document.getElementById('totalCount').innerText = totalCount;
-      document.getElementById('highQualityCount').innerText = highQualityIPs.length;
-      document.getElementById('failedCount').innerText = failedCount;
-      addUILog(\`📂 已加载 \${customIPs.length} 个自定义IP，总IP \${totalCount} 个，优质池 \${highQualityIPs.length} 个，失败池 \${failedCount} 个\`);
-      renderTable();
+      
+      await loadLogs();
+      alert('DNS配置保存成功！');
     }
 
     async function saveCustomIPs() {
       const text = document.getElementById('customIPs').value.trim();
-      const lines = text.split('\\n').map(l => l.trim()).filter(l => l && !l.startsWith('#'));
+      const lines = text.split('\\n').map(l => l.trim()).filter(l => l);
       if (!lines.length) return;
 
-      const res = await fetch('/api/save-custom-ips', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ips: lines })
-      });
-      const data = await res.json();
-      if (data.success) {
-        addUILog(\`✅ 保存成功: \${data.expandedCount} 个IP\`);
-        setTimeout(loadIPs, 1000);
-        await loadLogs();
+      try {
+        const res = await fetch('/api/save-custom-ips', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ips: lines })
+        });
+        
+        const data = await res.json();
+        if (data.success) {
+          alert(\`保存成功！展开后 \${data.expandedCount} 个IP\`);
+          setTimeout(async () => {
+            await manualUpdate();
+          }, 2000);
+        }
+      } catch (e) {
+        console.error('保存自定义IP失败:', e);
+        alert('保存失败：' + e.message);
       }
     }
 
@@ -1852,101 +1914,122 @@ function getMainHTML(env) {
       if (!confirm('清除所有自定义IP？')) return;
       await fetch('/api/clear-custom-ips', { method: 'POST' });
       document.getElementById('customIPs').value = '';
-      addUILog('✅ 自定义IP已清除');
-      setTimeout(loadIPs, 1000);
+      setTimeout(manualUpdate, 2000);
       await loadLogs();
     }
 
     async function loadIPs() {
-      const res = await fetch('/api/ips');
-      const data = await res.json();
-      highQualityIPs = data.highQualityIPs || [];
-      speeds = data.speeds || {};
-      customIPs = data.customIPs || [];
-      totalCount = data.totalCount || 0;
-      failedCount = data.failedCount || 0;
-      allIPs = data.allIPs || [];
-      
-      document.getElementById('totalCount').innerText = totalCount;
-      document.getElementById('highQualityCount').innerText = highQualityIPs.length;
-      document.getElementById('failedCount').innerText = failedCount;
-      document.getElementById('lastUpdateBadge').innerText = data.lastUpdate ? 
-        new Date(data.lastUpdate).toLocaleString() : '暂无更新';
-      
-      renderTable();
+      try {
+        const res = await fetch('/api/ips');
+        const data = await res.json();
+        
+        highQualityIPs = data.highQualityIPs || [];
+        allIPs = data.allIPs || [];
+        
+        document.getElementById('totalCount').innerText = data.totalCount || 0;
+        document.getElementById('highQualityCount').innerText = highQualityIPs.length;
+        document.getElementById('failedCount').innerText = data.failedCount || 0;
+        document.getElementById('lastUpdateBadge').innerText = data.lastUpdate || '暂无更新';
+        
+        renderTable();
+        
+      } catch (e) {
+        console.error('加载IP失败:', e);
+      }
     }
 
-    function getStarLevel(latency) {
-      if (latency <= 30) return '⭐⭐⭐⭐⭐';
-      if (latency <= 60) return '⭐⭐⭐⭐';
-      if (latency <= 90) return '⭐⭐⭐';
-      if (latency <= 120) return '⭐⭐';
-      if (latency <= 150) return '⭐';
-      return '';
+    async function manualUpdate() {
+      const btn = document.querySelector('button[onclick="manualUpdate()"]');
+      const originalText = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = '更新中...';
+      
+      try {
+        await fetch('/api/update', { method: 'POST' });
+        
+        setTimeout(async () => {
+          await loadIPs();
+          await loadLogs();
+          btn.disabled = false;
+          btn.textContent = originalText;
+        }, 3000);
+      } catch (e) {
+        console.error('更新失败:', e);
+        btn.disabled = false;
+        btn.textContent = originalText;
+      }
     }
 
     function renderTable() {
       const search = document.getElementById('search').value.toLowerCase();
-      
       const items = highQualityIPs
         .filter(item => item.ip.toLowerCase().includes(search))
         .sort((a, b) => a.latency - b.latency);
       
-      document.getElementById('ipTable').innerHTML = items.length ? items.map(item => {
-        const starLevel = getStarLevel(item.latency);
-        return \`<tr>
+      document.getElementById('ipTable').innerHTML = items.length ? items.map(item => 
+        \`<tr>
           <td class="ip-cell">\${item.ip}</td>
           <td class="delay-good">\${item.latency}ms</td>
-          <td>\${starLevel}</td>
+          <td>\${item.star_level || ''}</td>
           <td><button class="btn btn-sm btn-secondary" onclick="copyIP('\${item.ip}')">复制</button></td>
-        </tr>\`;
-      }).join('') : '<tr><td colspan="4" style="text-align:center;padding:20px;">暂无测速数据</td></tr>';
+        </tr>\`
+      ).join('') : '<tr><td colspan="4" style="text-align:center;padding:20px;">暂无优质IP，请点击"开始测速"</td></tr>';
     }
 
     document.getElementById('search').addEventListener('input', renderTable);
 
-    async function manualUpdate() {
-      await loadIPs();
-      addUILog('🔄 已刷新列表');
-    }
-
     function copyIP(ip) {
       navigator.clipboard.writeText(ip);
-      addUILog(\`📋 已复制 \${ip}\`);
     }
 
-    async function getBestIPs() {
-      return highQualityIPs.slice(0, uiConfig.ipCount).map(item => item.ip);
+    function exportHighQualityIPs() {
+      if (!highQualityIPs.length) {
+        alert('暂无优质IP可导出');
+        return;
+      }
+      
+      let content = '# CF优选IP 优质池列表 (≤90ms)\\n';
+      content += '# 生成时间: ' + new Date().toLocaleString() + '\\n';
+      content += '# 总数量: ' + highQualityIPs.length + ' 个\\n\\n';
+      
+      highQualityIPs.forEach(item => {
+        content += \`\${item.ip} \${item.latency}ms \${item.star_level || ''}\\n\`;
+      });
+      
+      const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = \`cf_优质IP_\${new Date().getTime()}.txt\`;
+      a.click();
+      URL.revokeObjectURL(url);
     }
 
     async function updateDNSWithBest() {
-      const best = await getBestIPs();
-      if (!best.length) return addUILog('❌ 无可用IP');
+      const best = highQualityIPs.slice(0, uiConfig.ipCount).map(item => item.ip);
+      if (!best.length) return alert('无可用IP');
       
-      const res = await fetch('/api/update-dns', {
+      await fetch('/api/update-dns', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ips: best })
       });
-      const data = await res.json();
-      if (data.success) {
-        addUILog(\`✅ DNS更新 \${data.count} 个IP\`);
-        await loadLogs();
-      }
+      
+      await loadLogs();
     }
 
     async function speedTestIP(ip) {
       try {
         const res = await fetch(\`/api/speedtest?ip=\${ip}\`);
-        const data = await res.json();
-        if (data.success) {
-          addUILog(\`✅ \${ip} - \${data.latency}ms \${getStarLevel(data.latency)}\`);
+        await res.json();
+        
+        if (totalTested % 5 === 0) {
+          await loadLogs();
           await loadIPs();
-        } else {
-          addUILog(\`❌ \${ip} - 失败\`);
         }
-      } catch (error) {
-        addUILog(\`❌ \${ip} - 请求失败\`);
+        
+      } catch (e) {
+        console.error(\`测速失败 \${ip}:\`, e);
       }
       
       totalTested++;
@@ -1959,26 +2042,74 @@ function getMainHTML(env) {
       } else if (--activeThreads === 0) {
         isSpeedTesting = false;
         document.getElementById('speedTestBtn').disabled = false;
-        document.getElementById('speedTestBtn').textContent = '测速';
+        document.getElementById('speedTestBtn').textContent = '开始测速';
         document.getElementById('speedProgress').style.display = 'none';
         document.getElementById('speedStatus').style.display = 'none';
+        
+        // 测速完成后加载最新IP列表
         await loadLogs();
         await loadIPs();
+        
+        // ====== 新增：自动更新DNS检查 ======
+        // 检查是否开启了测速后自动更新DNS
+        const autoUpdateAfterTestChecked = document.getElementById('autoUpdateDNSAfterTest').checked;
+        if (autoUpdateAfterTestChecked) {
+          // 获取最新的优质IP列表
+          const bestIPs = highQualityIPs.slice(0, uiConfig.ipCount).map(item => item.ip);
+          
+          if (bestIPs.length > 0) {
+            // 显示更新状态
+            const statusEl = document.getElementById('speedStatus');
+            statusEl.style.display = 'block';
+            statusEl.innerHTML = '🔄 正在自动更新DNS...';
+            
+            try {
+              // 调用DNS更新接口
+              const dnsRes = await fetch('/api/update-dns', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ ips: bestIPs })
+              });
+              
+              const dnsData = await dnsRes.json();
+              
+              if (dnsData.success) {
+                statusEl.innerHTML = \`✅ DNS自动更新成功: \${dnsData.count || bestIPs.length} 个IP\`;
+                setTimeout(() => {
+                  statusEl.style.display = 'none';
+                }, 3000);
+              } else {
+                statusEl.innerHTML = '❌ DNS自动更新失败';
+                setTimeout(() => {
+                  statusEl.style.display = 'none';
+                }, 3000);
+              }
+            } catch (e) {
+              console.error('自动更新DNS失败:', e);
+              statusEl.innerHTML = '❌ DNS自动更新异常';
+              setTimeout(() => {
+                statusEl.style.display = 'none';
+              }, 3000);
+            }
+            
+            // 刷新日志
+            await loadLogs();
+          }
+        }
+        // ====== 新增结束 ======
       }
     }
 
     async function startSpeedTest() {
-      if (isSpeedTesting) return;
-
-      await loadIPs();
-      
-      const testCount = parseInt(document.getElementById('testCount').value) || 50;
-      const threadCount = parseInt(document.getElementById('threadCount').value) || 10;
-      
-      if (allIPs.length === 0) {
-        addUILog('❌ 没有可测速的IP，请先刷新IP列表');
+      if (isSpeedTesting || !allIPs.length) {
+        if (!allIPs.length) {
+          alert('没有可测速的IP，请先点击"刷新IP列表"');
+        }
         return;
       }
+
+      const testCount = parseInt(document.getElementById('testCount').value) || 50;
+      const threadCount = parseInt(document.getElementById('threadCount').value) || 10;
       
       const shuffled = [...allIPs].sort(() => 0.5 - Math.random());
       const queue = shuffled.slice(0, Math.min(testCount, allIPs.length));
@@ -1987,7 +2118,7 @@ function getMainHTML(env) {
       activeThreads = 0;
       totalTested = 0;
       totalToTest = queue.length;
-      testQueue = queue;
+      testQueue = [...queue];
       
       document.getElementById('speedTestBtn').disabled = true;
       document.getElementById('speedTestBtn').textContent = '测速中';
@@ -1995,7 +2126,7 @@ function getMainHTML(env) {
       document.getElementById('speedStatus').style.display = 'block';
       document.getElementById('speedProgressFill').style.width = '0%';
       
-      addUILog(\`⚡ 开始测速，共 \${totalToTest} 个IP，线程数 \${threadCount}\`);
+      await loadLogs();
       
       for (let i = 0; i < threadCount && testQueue.length; i++) {
         activeThreads++;
