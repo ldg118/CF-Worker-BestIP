@@ -1,6 +1,6 @@
 🌩️ CF-Worker-BestIP
 
-一个部署在 Cloudflare Workers 上的强大工具：自动收集、测速并优选 Cloudflare IP，支持多线程测速、DNS 自动更新，并能根据访客地区智能返回最优 IP。
+一个部署在 Cloudflare Workers 上的强大工具：自动收集、测试并优选 Cloudflare IP，支持多线程测速、DNS 自动更新，并能根据访客地区智能返回最优 IP。
 
 ✨ 项目简介
 CF-Worker-BestIP 是一个集IP收集、测速、优选和DNS自动更新于一体的全能工具。它部署在 Cloudflare Workers 上，无需维护服务器，即可：
@@ -65,14 +65,13 @@ DEFAULT_THREAD_COUNT = "10"
 
 ⚙️ 配置说明
 环境变量
-变量名	说明	默认值	范围
- ```ADMIN_PASSWORD ```	（必填） 管理员登录密码。	无	-
- 
- ```DEFAULT_IP_COUNT ```	每次更新 DNS 时，优选 IP 的数量，默认	3，（	范围1 - 10）
- 
- ```DEFAULT_TEST_COUNT ```	每次手动或自动测速时，测试的 IP 数量。默认200	（	范围1 - 1000）
- 
- ```DEFAULT_THREAD_COUNT ```	测速时的并发线程数。	默认```10	```（范围1 - 50）
+| 变量名 |	 说明 | 	范围 |默认值 | 	
+| ADMIN_PASSWOR D|	管理员密码（必填）|	your_secure_password|
+| DEFAULT_IP_COUNT	| 默认IP数量（1-10）	| 3 |
+| DEFAULT_TEST_COUNT	| 默认测速数量（1-1000）|	50
+| DEFAULT_THREAD_COUNT	| 默认线程数（1-50）|	10
+| FAILED_IP_COOLDOWN_DAYS |	失败IP冷却天数（1-30）|	15
+| MAX_HIGH_QUALITY_POOL_SIZE	| 优质池最大容量（10-200）| 	50
  
 注意：以上环境变量仅在首次部署或 KV 中无配置时作为默认值。界面上的修改会保存到 KV，并覆盖环境变量的默认值。
 
