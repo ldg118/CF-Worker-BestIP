@@ -99,14 +99,14 @@ CF-Worker-BestIP 部署教程
 
 ⚙️ 配置说明
 环境变量
-| 变量名|	说明 |默认值 | 
-|--------|---------|-----|
-| ADMIN_PASSWOR D|	管理员密码（必填）|	your_secure_password|
-| DEFAULT_IP_COUNT	| 默认IP数量（1-10）	| 3 |
-| DEFAULT_TEST_COUNT	| 默认测速数量（1-1000）|	50
-| DEFAULT_THREAD_COUNT	| 默认线程数（1-50）|	10
-| FAILED_IP_COOLDOWN_DAYS |	失败IP冷却天数（1-30）|	15
-| MAX_HIGH_QUALITY_POOL_SIZE	| 优质池最大容量（10-200）| 	50
+| 变量名|	说明 |默认值 | 必填|
+|--------|---------|-----|-----|
+| ADMIN_PASSWOR D|	管理员密码（必填）|	your_secure_password|✅ 是|
+| DEFAULT_IP_COUNT	| 默认IP数量（1-10）	| 3 |否|
+| DEFAULT_TEST_COUNT	| 默认测速数量（1-1000）|	50|否|
+| DEFAULT_THREAD_COUNT	| 默认线程数（1-50）|	10|否|
+| FAILED_IP_COOLDOWN_DAYS |	失败IP冷却天数（1-30）|	15|否|
+| MAX_HIGH_QUALITY_POOL_SIZE	| 优质池最大容量（10-200）| 	50|否|
  
 注意：以上环境变量仅在首次部署或 KV 中无配置时作为默认值。界面上的修改会保存到 KV，并覆盖环境变量的默认值。
 
