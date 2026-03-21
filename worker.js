@@ -1,5 +1,5 @@
 // Cloudflare Worker 优选IP可视化面板 - 最终版（优质池只保存≤90ms）
-// 版本: v2.9.3
+// 版本: v2.9.4
 // 项目地址: https://github.com/ldg118/CF-Worker-BestIP
 // 需要绑定的KV命名空间：KV
 // 需要绑定的D1数据库：DB
@@ -7,19 +7,15 @@
 // 环境变量：DEFAULT_IP_COUNT (1-10，默认3)
 // 环境变量：DEFAULT_TEST_COUNT (1-1000，默认50)
 // 环境变量：DEFAULT_THREAD_COUNT (1-50，默认10)
-// 环境变量：FAILED_IP_COOLDOWN_DAYS (1-30，默认15) - 可作为默认值
-// 环境变量：MAX_HIGH_QUALITY_POOL_SIZE (10-200，默认50) - 可作为默认值
+// 环境变量：FAILED_IP_COOLDOWN_DAYS (1-30，默认15)
+// 环境变量：MAX_HIGH_QUALITY_POOL_SIZE (10-200，默认50)
 
-const VERSION = 'v2.9.3';
+const VERSION = 'v2.9.4';
 const GITHUB_URL = 'https://github.com/ldg118/CF-Worker-BestIP';
 
 const CONFIG = {
   sources: [
-//可以自定义IP地址
-    'https://ip.164746.xyz',
-    'https://cf.090227.xyz',
-    'https://monitor.gacjie.cn/page/cloudflare/ipv4.html',
-    'https://stock.hostmonit.com/CloudFlareYes
+    'https://raw.githubusercontent.com/ldg118/CF-Worker-BestIP/refs/heads/main/cfv4'
   ],
   kvKeys: {
     ipList: 'ip_list',
@@ -28,17 +24,17 @@ const CONFIG = {
     sessions: 'sessions',
     customIPs: 'custom_ips',
     uiConfig: 'ui_config',
-    advancedConfig: 'advanced_config'  // 新增高级配置存储
+    advancedConfig: 'advanced_config'
   }
 };
 
 // 优质IP分级阈值
 const QUALITY_LEVELS = {
-  FIVE_STAR: 30,   // ⭐⭐⭐⭐⭐ <=30ms
-  FOUR_STAR: 60,   // ⭐⭐⭐⭐ <=60ms
-  THREE_STAR: 90,  // ⭐⭐⭐ <=90ms
-  TWO_STAR: 120,   // ⭐⭐ <=120ms
-  ONE_STAR: 150    // ⭐ <=150ms
+  FIVE_STAR: 30,
+  FOUR_STAR: 60,
+  THREE_STAR: 90,
+  TWO_STAR: 120,
+  ONE_STAR: 150
 };
 
 // 国家代码映射
@@ -474,6 +470,98 @@ async function speedTest(env, ip) {
   }
 }
 
+// ========== 智能测速（定时任务专用）==========
+async function smartSpeedTest(env) {
+  try {
+    // 获取当前优质池状态
+    const highQualityIPs = await getHighQualityIPs(env);
+    const currentCount = highQualityIPs.length;
+    
+    const config = getEnvConfig(env);
+    const uiConfig = await env.KV.get(CONFIG.kvKeys.uiConfig, 'json') || {};
+    const advancedConfig = await getAdvancedConfig(env);
+    const maxPoolSize = advancedConfig.maxHighQualityPoolSize;
+    
+    let testCount = uiConfig.testCount || config.defaultTestCount;
+    let testStrategy = '';
+    
+    // 根据优质池数量调整测速数量
+    if (currentCount < 10) {
+      testCount = Math.min(testCount * 2, 200);
+      testStrategy = '🔴 全力测速模式';
+    } else if (currentCount < 30) {
+      testCount = Math.min(testCount, 100);
+      testStrategy = '🟡 补充测速模式';
+    } else if (currentCount < maxPoolSize) {
+      testCount = Math.min(testCount, 30);
+      testStrategy = '🟢 轻量测速模式';
+    } else {
+      testCount = Math.min(testCount, 20);
+      testStrategy = '✅ 保鲜测速模式';
+    }
+    
+    await addSystemLog(env, `📊 ${testStrategy} | 优质池: ${currentCount}/${maxPoolSize} | 本次测速: ${testCount}个IP`);
+    
+    // 获取所有IP
+    const allIPs = await getAllIPs(env);
+    if (!allIPs.length) {
+      await addSystemLog(env, '⚠️ 没有可测速的IP');
+      return;
+    }
+    
+    // 获取已测速过的IP（避免重复测试同一批）
+    const existingResult = await env.DB.prepare('SELECT ip FROM high_quality_ips').all();
+    const existingSet = new Set(existingResult.results.map(row => row.ip));
+    
+    // 优先测试未在优质池中的IP
+    const untestedIPs = allIPs.filter(ip => !existingSet.has(ip));
+    
+    // 随机打乱顺序（保证随机性）
+    const shuffledUntested = [...untestedIPs].sort(() => 0.5 - Math.random());
+    const ipsToTest = shuffledUntested.slice(0, testCount);
+    
+    if (ipsToTest.length === 0) {
+      await addSystemLog(env, 'ℹ️ 所有IP都已测试过，跳过测速');
+      return;
+    }
+    
+    await addSystemLog(env, `📊 开始智能测速: 测试 ${ipsToTest.length} 个IP（随机顺序）`);
+    
+    // 执行测速
+    const threadCount = uiConfig.threadCount || config.defaultThreadCount;
+    let completed = 0;
+    let successCount = 0;
+    const total = ipsToTest.length;
+    
+    for (let i = 0; i < ipsToTest.length; i += threadCount) {
+      const batch = ipsToTest.slice(i, i + threadCount);
+      const promises = batch.map(async (ip) => {
+        const result = await speedTest(env, ip);
+        if (result.success) successCount++;
+        completed++;
+        
+        if (completed % Math.ceil(total / 10) === 0 || completed === total) {
+          await addSystemLog(env, `📊 测速进度: ${completed}/${total} (${Math.round(completed/total*100)}%)`);
+        }
+        return result;
+      });
+      
+      await Promise.all(promises);
+      
+      if (i + threadCount < ipsToTest.length) {
+        await new Promise(resolve => setTimeout(resolve, 500));
+      }
+    }
+    
+    const newCount = (await getHighQualityIPs(env)).length;
+    await addSystemLog(env, `✅ 智能测速完成 | 成功: ${successCount}/${total} | 优质池: ${newCount}/${maxPoolSize}`);
+    
+  } catch (e) {
+    await addSystemLog(env, `❌ 智能测速失败: ${e.message}`);
+    console.error('智能测速失败:', e);
+  }
+}
+
 // ========== DNS更新 ==========
 async function updateDNSBatch(env, ips, triggerSource = 'manual') {
   try {
@@ -530,7 +618,6 @@ async function updateDNSBatch(env, ips, triggerSource = 'manual') {
         default: triggerText = '👤 手动操作';
       }
       
-      // 获取更新IP的详细信息（延迟）
       const highQualityIPs = await getHighQualityIPs(env);
       const ipInfoMap = new Map();
       highQualityIPs.forEach(item => {
@@ -548,7 +635,6 @@ async function updateDNSBatch(env, ips, triggerSource = 'manual') {
         const ipInfo = ipInfoMap.get(ip);
         const latency = ipInfo ? `${ipInfo.latency}ms` : '未知';
         
-        // 根据设置决定是否隐藏IP
         let displayIp = ip;
         if (dnsConfig.telegramHideIP) {
           const ipParts = ip.split('.');
@@ -581,8 +667,11 @@ async function checkAndRefillHighQualityPool(env) {
     ).bind(QUALITY_LEVELS.THREE_STAR).first();
     const currentCount = countResult.count;
     
+    const advancedConfig = await getAdvancedConfig(env);
+    const maxPoolSize = advancedConfig.maxHighQualityPoolSize;
+    
     if (currentCount < 30) {
-      await addSystemLog(env, `🔍 优质池数量不足 (${currentCount}/30)，开始补充`);
+      await addSystemLog(env, `🔍 优质池数量不足 (${currentCount}/${maxPoolSize})，开始补充`);
       const allIPs = await getAllIPs(env);
       const existingResult = await env.DB.prepare('SELECT ip FROM high_quality_ips').all();
       const existingSet = new Set(existingResult.results.map(row => row.ip));
@@ -711,7 +800,6 @@ async function handleSaveAdvancedConfig(request, env) {
     
     await env.KV.put(CONFIG.kvKeys.advancedConfig, JSON.stringify(config));
     
-    // 如果勾选了清空失败IP黑名单
     if (clearFailedIPs) {
       await env.DB.prepare('DELETE FROM failed_ips').run();
       await addSystemLog(env, '🗑️ 失败IP黑名单已手动清空');
@@ -865,6 +953,17 @@ export default {
           headers: { 'Content-Type': 'application/json' }
         });
       }
+    }
+
+    if (path === '/api/smart-speedtest' && request.method === 'POST') {
+      await addSystemLog(env, '🔧 手动触发智能测速');
+      ctx.waitUntil(smartSpeedTest(env));
+      return new Response(JSON.stringify({ 
+        success: true, 
+        message: '智能测速已启动，请查看日志' 
+      }), {
+        headers: { 'Content-Type': 'application/json' }
+      });
     }
 
     if (path === '/api/ips') {
@@ -1039,27 +1138,59 @@ export default {
   },
 
   async scheduled(event, env, ctx) {
-    await initDatabase(env);
-    await cleanExpiredFailedIPs(env);
-    await addSystemLog(env, '⏰ Cron定时任务启动');
-    await updateIPs(env);
-    await checkAndRefillHighQualityPool(env);
+    const startTime = Date.now();
+    await addSystemLog(env, `⏰ Cron定时任务启动`);
     
-    const dnsConfig = await env.KV.get(CONFIG.kvKeys.dnsConfig, 'json');
-    if (dnsConfig?.autoUpdate) {
-      const config = getEnvConfig(env);
-      const uiConfig = await env.KV.get(CONFIG.kvKeys.uiConfig, 'json') || {};
-      const ipCount = uiConfig.ipCount || config.defaultIpCount;
-      const bestIPs = await getBestIPs(env, ipCount);
+    try {
+      // 1. 初始化数据库和清理过期IP
+      await initDatabase(env);
+      await cleanExpiredFailedIPs(env);
+      await addSystemLog(env, '✅ 数据库初始化完成');
       
-      if (bestIPs.length > 0) {
-        const result = await updateDNSBatch(env, bestIPs, 'cron');
-        if (result.success) {
-          await addSystemLog(env, `✅ Cron自动更新DNS成功: ${result.count} 个IP`);
+      // 2. 更新IP列表
+      await addSystemLog(env, '🔄 开始从数据源获取IP...');
+      const ipList = await updateIPs(env);
+      await addSystemLog(env, `✅ IP列表更新完成: ${ipList.length} 个IP`);
+      
+      // 3. 智能测速优选（随机选择IP进行测速）
+      await addSystemLog(env, '📊 开始智能测速优选...');
+      await smartSpeedTest(env);
+      await addSystemLog(env, '✅ 智能测速优选完成');
+      
+      // 4. 检查并补充优质池（确保优质池有足够IP）
+      await checkAndRefillHighQualityPool(env);
+      
+      // 5. 自动更新DNS（如果启用）
+      const dnsConfig = await env.KV.get(CONFIG.kvKeys.dnsConfig, 'json');
+      if (dnsConfig?.autoUpdate) {
+        await addSystemLog(env, '🌐 检测到自动DNS更新已启用，开始更新...');
+        const config = getEnvConfig(env);
+        const uiConfig = await env.KV.get(CONFIG.kvKeys.uiConfig, 'json') || {};
+        const ipCount = uiConfig.ipCount || config.defaultIpCount;
+        const bestIPs = await getBestIPs(env, ipCount);
+        
+        if (bestIPs.length > 0) {
+          await addSystemLog(env, `📊 找到 ${bestIPs.length} 个优质IP，准备更新DNS`);
+          const result = await updateDNSBatch(env, bestIPs, 'cron');
+          if (result.success) {
+            await addSystemLog(env, `✅ Cron自动更新DNS成功: ${result.count} 个IP`);
+          } else {
+            await addSystemLog(env, `❌ Cron自动更新DNS失败: ${result.error || '未知错误'}`);
+          }
+        } else {
+          await addSystemLog(env, '⚠️ 未找到优质IP，跳过DNS更新');
         }
+      } else {
+        await addSystemLog(env, 'ℹ️ 自动DNS更新未启用，跳过');
       }
+      
+      const duration = Date.now() - startTime;
+      await addSystemLog(env, `✅ Cron定时任务完成 - 总耗时: ${duration}ms`);
+      
+    } catch (error) {
+      await addSystemLog(env, `❌ Cron定时任务异常: ${error.message}`);
+      console.error('Cron任务失败:', error);
     }
-    await addSystemLog(env, '✅ Cron定时任务完成');
   }
 };
 
@@ -1578,7 +1709,7 @@ function getMainHTML(env) {
 <body>
   <div class="container">
     <div class="header">
-      <h1>🌩️ CF优选IP · 智能优选</h1>
+      <h1>🌩️ CF优选IP · 智能优选 <span class="version-text">${VERSION}</span></h1>
       <div class="header-right">
         <a href="/settings" class="settings-btn">⚙️ 设置</a>
         <a href="${GITHUB_URL}" target="_blank" class="github-btn">⭐ GitHub</a>
@@ -1591,7 +1722,7 @@ function getMainHTML(env) {
       <div>
         <div class="card">
           <div class="card-header">
-            <h2>📋 优质IP列表 (≤90ms) <span class="version-text">${VERSION}</span></h2>
+            <h2>📋 优质IP列表 (≤90ms)</h2>
             <div>
               <button class="btn btn-sm btn-primary" onclick="manualUpdate()">刷新IP列表</button>
               <button class="btn btn-sm btn-warning" onclick="startSpeedTest()" id="speedTestBtn">开始测速</button>
@@ -1686,6 +1817,7 @@ function getMainHTML(env) {
             <h3 style="color: #60a5fa; font-size: 14px; margin-bottom: 12px;">🗄️ 数据库管理</h3>
             <button class="btn btn-success full-width" onclick="initDatabase()" id="initDbBtn">手动初始化数据库</button>
             <button class="btn btn-primary full-width" style="margin-top: 8px;" onclick="checkDBStatus()">检查数据库状态</button>
+            <button class="btn btn-warning full-width" style="margin-top: 8px;" onclick="smartSpeedTest()">智能测速优选</button>
           </div>
 
           <div style="background: #0f172a; padding: 16px; border-radius: 8px; margin-bottom: 20px;">
@@ -1862,6 +1994,35 @@ function getMainHTML(env) {
       
       btn.disabled = false;
       btn.textContent = '手动初始化数据库';
+    }
+
+    async function smartSpeedTest() {
+      if (!confirm('手动触发智能测速？这将测试一批随机IP，可能需要几分钟')) return;
+      
+      const btn = event.target;
+      const originalText = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = '测速中...';
+      
+      try {
+        const res = await fetch('/api/smart-speedtest', { method: 'POST' });
+        const data = await res.json();
+        
+        if (data.success) {
+          alert('智能测速已启动，请稍后查看日志');
+          setTimeout(() => {
+            loadLogs();
+            loadIPs();
+          }, 3000);
+        } else {
+          alert('启动失败: ' + (data.error || '未知错误'));
+        }
+      } catch (e) {
+        alert('启动失败: ' + e.message);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = originalText;
+      }
     }
 
     async function loadUIConfig() {
