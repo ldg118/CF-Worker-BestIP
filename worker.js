@@ -1,21 +1,20 @@
-// Cloudflare Worker 优选IP可视化面板 - 最终版（优质池只保存≤90ms）
-// 版本: v2.9.4
+// Cloudflare Worker 优选IP可视化面板 - 完整版
+// 版本: v2.9.5
 // 项目地址: https://github.com/ldg118/CF-Worker-BestIP
 // 需要绑定的KV命名空间：KV
 // 需要绑定的D1数据库：DB
 // 需要在环境变量中设置：ADMIN_PASSWORD
-// 环境变量：DEFAULT_IP_COUNT (1-10，默认3)
-// 环境变量：DEFAULT_TEST_COUNT (1-1000，默认50)
-// 环境变量：DEFAULT_THREAD_COUNT (1-50，默认10)
-// 环境变量：FAILED_IP_COOLDOWN_DAYS (1-30，默认15)
-// 环境变量：MAX_HIGH_QUALITY_POOL_SIZE (10-200，默认50)
 
-const VERSION = 'v2.9.4';
+const VERSION = 'v2.9.5';
 const GITHUB_URL = 'https://github.com/ldg118/CF-Worker-BestIP';
 
 const CONFIG = {
-  sources: [
-    'https://raw.githubusercontent.com/ldg118/CF-Worker-BestIP/refs/heads/main/cfv4'
+  defaultSources: [
+    // 可以自定义链接
+    'https://ip.164746.xyz',
+    'https://cf.090227.xyz',
+    'https://monitor.gacjie.cn/page/cloudflare/ipv4.html',
+    'https://stock.hostmonit.com/CloudFlareYes
   ],
   kvKeys: {
     ipList: 'ip_list',
@@ -24,7 +23,8 @@ const CONFIG = {
     sessions: 'sessions',
     customIPs: 'custom_ips',
     uiConfig: 'ui_config',
-    advancedConfig: 'advanced_config'
+    advancedConfig: 'advanced_config',
+    dataSources: 'data_sources'
   }
 };
 
@@ -173,6 +173,31 @@ function getStarLevel(latency) {
   if (latency <= QUALITY_LEVELS.TWO_STAR) return '⭐⭐';
   if (latency <= QUALITY_LEVELS.ONE_STAR) return '⭐';
   return '';
+}
+
+// ========== 获取数据源 ==========
+async function getDataSources(env) {
+  const userSources = await env.KV.get(CONFIG.kvKeys.dataSources, 'json') || [];
+  if (userSources.length === 0) {
+    return CONFIG.defaultSources;
+  }
+  return userSources;
+}
+
+async function saveDataSources(env, sources) {
+  const validSources = [];
+  for (const source of sources) {
+    if (source.trim() && (source.startsWith('http://') || source.startsWith('https://'))) {
+      validSources.push(source.trim());
+    }
+  }
+  
+  if (validSources.length === 0) {
+    return { success: false, error: '至少需要一个有效的URL' };
+  }
+  
+  await env.KV.put(CONFIG.kvKeys.dataSources, JSON.stringify(validSources));
+  return { success: true, sources: validSources };
 }
 
 // ========== 发送Telegram通知 ==========
@@ -387,7 +412,9 @@ async function saveSpeedResult(env, ip, latency, testCount) {
 async function updateIPs(env) {
   let allIPs = new Set();
   
-  for (const source of CONFIG.sources) {
+  const sources = await getDataSources(env);
+  
+  for (const source of sources) {
     try {
       const resp = await fetch(source);
       const text = await resp.text();
@@ -407,7 +434,7 @@ async function updateIPs(env) {
       
       await addSystemLog(env, `📡 从 ${source} 获取到 ${matches.length} 个CIDR，展开后 ${expandedCount} 个IP`);
     } catch (e) {
-      await addSystemLog(env, `❌ 从 ${source} 获取失败`);
+      await addSystemLog(env, `❌ 从 ${source} 获取失败: ${e.message}`);
     }
   }
 
@@ -425,7 +452,7 @@ async function updateIPs(env) {
   await env.KV.put(CONFIG.kvKeys.ipList, JSON.stringify(ipList));
   await env.KV.put(CONFIG.kvKeys.lastUpdate, new Date().toLocaleString('zh-CN'));
   
-  await addSystemLog(env, `🔄 IP列表已更新: ${ipList.length} 个IP`);
+  await addSystemLog(env, `🔄 IP列表已更新: ${ipList.length} 个IP (来自 ${sources.length} 个数据源)`);
   return ipList;
 }
 
@@ -470,10 +497,9 @@ async function speedTest(env, ip) {
   }
 }
 
-// ========== 智能测速（定时任务专用）==========
+// ========== 智能测速 ==========
 async function smartSpeedTest(env) {
   try {
-    // 获取当前优质池状态
     const highQualityIPs = await getHighQualityIPs(env);
     const currentCount = highQualityIPs.length;
     
@@ -485,7 +511,6 @@ async function smartSpeedTest(env) {
     let testCount = uiConfig.testCount || config.defaultTestCount;
     let testStrategy = '';
     
-    // 根据优质池数量调整测速数量
     if (currentCount < 10) {
       testCount = Math.min(testCount * 2, 200);
       testStrategy = '🔴 全力测速模式';
@@ -502,21 +527,15 @@ async function smartSpeedTest(env) {
     
     await addSystemLog(env, `📊 ${testStrategy} | 优质池: ${currentCount}/${maxPoolSize} | 本次测速: ${testCount}个IP`);
     
-    // 获取所有IP
     const allIPs = await getAllIPs(env);
     if (!allIPs.length) {
       await addSystemLog(env, '⚠️ 没有可测速的IP');
       return;
     }
     
-    // 获取已测速过的IP（避免重复测试同一批）
     const existingResult = await env.DB.prepare('SELECT ip FROM high_quality_ips').all();
     const existingSet = new Set(existingResult.results.map(row => row.ip));
-    
-    // 优先测试未在优质池中的IP
     const untestedIPs = allIPs.filter(ip => !existingSet.has(ip));
-    
-    // 随机打乱顺序（保证随机性）
     const shuffledUntested = [...untestedIPs].sort(() => 0.5 - Math.random());
     const ipsToTest = shuffledUntested.slice(0, testCount);
     
@@ -527,7 +546,6 @@ async function smartSpeedTest(env) {
     
     await addSystemLog(env, `📊 开始智能测速: 测试 ${ipsToTest.length} 个IP（随机顺序）`);
     
-    // 执行测速
     const threadCount = uiConfig.threadCount || config.defaultThreadCount;
     let completed = 0;
     let successCount = 0;
@@ -606,7 +624,6 @@ async function updateDNSBatch(env, ips, triggerSource = 'manual') {
       if (result.success) successCount++;
     }
     
-    // 发送Telegram通知
     if (dnsConfig.telegramEnabled && successCount > 0) {
       const now = new Date();
       const timeStr = now.toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
@@ -966,6 +983,80 @@ export default {
       });
     }
 
+    // 数据源管理接口
+    if (path === '/api/get-data-sources') {
+      const sources = await getDataSources(env);
+      return new Response(JSON.stringify({ sources }), {
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
+    if (path === '/api/save-data-sources' && request.method === 'POST') {
+      const { sources } = await request.json();
+      const result = await saveDataSources(env, sources);
+      
+      if (result.success) {
+        await addSystemLog(env, `📝 数据源已更新: ${result.sources.length} 个源`);
+        ctx.waitUntil(updateIPs(env));
+      }
+      
+      return new Response(JSON.stringify(result), {
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
+    if (path === '/api/test-data-source' && request.method === 'POST') {
+      const { url } = await request.json();
+      
+      if (!url) {
+        return new Response(JSON.stringify({ success: false, error: 'URL不能为空' }), {
+          status: 400,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+      
+      try {
+        const resp = await fetch(url);
+        if (!resp.ok) {
+          throw new Error(`HTTP ${resp.status}`);
+        }
+        
+        const text = await resp.text();
+        const ipPattern = /\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?:\/[0-9]{1,2})?\b/g;
+        const matches = text.match(ipPattern) || [];
+        
+        let ipCount = 0;
+        let cidrCount = 0;
+        for (const item of matches) {
+          if (item.includes('/')) {
+            cidrCount++;
+            ipCount += expandCIDR(item).length;
+          } else if (isValidIPv4(item)) {
+            ipCount++;
+          }
+        }
+        
+        return new Response(JSON.stringify({
+          success: true,
+          url,
+          status: resp.status,
+          cidrCount,
+          ipCount,
+          preview: matches.slice(0, 5)
+        }), {
+          headers: { 'Content-Type': 'application/json' }
+        });
+      } catch (e) {
+        return new Response(JSON.stringify({
+          success: false,
+          error: e.message
+        }), {
+          status: 500,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+    }
+
     if (path === '/api/ips') {
       try {
         const [totalCount, highQualityIPs, lastUpdate, failedCount, customIPs, allIPs] = await Promise.all([
@@ -1142,25 +1233,20 @@ export default {
     await addSystemLog(env, `⏰ Cron定时任务启动`);
     
     try {
-      // 1. 初始化数据库和清理过期IP
       await initDatabase(env);
       await cleanExpiredFailedIPs(env);
       await addSystemLog(env, '✅ 数据库初始化完成');
       
-      // 2. 更新IP列表
       await addSystemLog(env, '🔄 开始从数据源获取IP...');
       const ipList = await updateIPs(env);
       await addSystemLog(env, `✅ IP列表更新完成: ${ipList.length} 个IP`);
       
-      // 3. 智能测速优选（随机选择IP进行测速）
       await addSystemLog(env, '📊 开始智能测速优选...');
       await smartSpeedTest(env);
       await addSystemLog(env, '✅ 智能测速优选完成');
       
-      // 4. 检查并补充优质池（确保优质池有足够IP）
       await checkAndRefillHighQualityPool(env);
       
-      // 5. 自动更新DNS（如果启用）
       const dnsConfig = await env.KV.get(CONFIG.kvKeys.dnsConfig, 'json');
       if (dnsConfig?.autoUpdate) {
         await addSystemLog(env, '🌐 检测到自动DNS更新已启用，开始更新...');
@@ -2485,6 +2571,47 @@ function getSettingsHTML(env) {
       <a href="/" class="back-btn">← 返回主页</a>
     </div>
 
+    <!-- 数据源管理 -->
+    <div class="card">
+      <div class="card-header">
+        <h2>📡 IP数据源管理</h2>
+      </div>
+      <div class="card-body">
+        <div class="info-text" style="margin-bottom: 12px;">
+          💡 支持导入IP列表或CIDR网段，每行一个，支持HTTP/HTTPS协议
+        </div>
+        
+        <div class="form-group">
+          <label>数据源列表</label>
+          <div id="sourcesList" style="margin-bottom: 12px;">
+            <!-- 动态加载数据源列表 -->
+          </div>
+          
+          <div style="display: flex; gap: 8px; margin-top: 8px;">
+            <input type="text" id="newSourceUrl" placeholder="https://example.com/ips.txt" style="flex: 1;">
+            <button class="btn btn-sm btn-success" onclick="addDataSource()">添加</button>
+          </div>
+        </div>
+        
+        <div class="form-group">
+          <label>数据源测试</label>
+          <div style="display: flex; gap: 8px;">
+            <input type="text" id="testUrl" placeholder="输入URL测试" style="flex: 1;">
+            <button class="btn btn-sm btn-primary" onclick="testDataSource()">测试</button>
+          </div>
+          <div id="testResult" style="margin-top: 8px; font-size: 12px; display: none;"></div>
+        </div>
+        
+        <div class="action-bar" style="margin-top: 16px;">
+          <button class="btn btn-primary" style="flex: 1;" onclick="saveDataSources()">保存数据源</button>
+          <button class="btn btn-secondary" style="flex: 1;" onclick="resetDataSources()">恢复默认</button>
+        </div>
+        <div class="info-text" style="margin-top: 12px; text-align: center;">
+          ⚡ 保存后将立即刷新IP列表
+        </div>
+      </div>
+    </div>
+
     <!-- DNS配置 -->
     <div class="card">
       <div class="card-header">
@@ -2614,6 +2741,180 @@ function getSettingsHTML(env) {
   </div>
 
   <script>
+    async function loadDataSources() {
+      try {
+        const res = await fetch('/api/get-data-sources');
+        const data = await res.json();
+        
+        const container = document.getElementById('sourcesList');
+        if (data.sources && data.sources.length) {
+          container.innerHTML = data.sources.map((source, index) => \`
+            <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 8px; background: #0f172a; padding: 8px; border-radius: 6px;">
+              <span style="flex: 1; font-family: monospace; font-size: 12px; word-break: break-all;">\${escapeHtml(source)}</span>
+              <button class="btn btn-sm btn-danger" onclick="removeDataSource(\${index})">删除</button>
+            </div>
+          \`).join('');
+        } else {
+          container.innerHTML = '<div style="color: #6b7280; text-align: center; padding: 20px;">暂无自定义数据源，将使用默认源</div>';
+        }
+      } catch (e) {
+        console.error('加载数据源失败:', e);
+      }
+    }
+
+    function addDataSource() {
+      const url = document.getElementById('newSourceUrl').value.trim();
+      if (!url) {
+        alert('请输入URL');
+        return;
+      }
+      
+      if (!url.startsWith('http://') && !url.startsWith('https://')) {
+        alert('URL必须以http://或https://开头');
+        return;
+      }
+      
+      const container = document.getElementById('sourcesList');
+      const newItem = document.createElement('div');
+      newItem.style.cssText = 'display: flex; align-items: center; gap: 8px; margin-bottom: 8px; background: #0f172a; padding: 8px; border-radius: 6px;';
+      newItem.innerHTML = \`
+        <span style="flex: 1; font-family: monospace; font-size: 12px; word-break: break-all;">\${escapeHtml(url)}</span>
+        <button class="btn btn-sm btn-danger" onclick="this.parentElement.remove()">删除</button>
+      \`;
+      container.appendChild(newItem);
+      
+      document.getElementById('newSourceUrl').value = '';
+    }
+
+    function removeDataSource(index) {
+      const items = document.querySelectorAll('#sourcesList > div');
+      if (items[index]) {
+        items[index].remove();
+      }
+    }
+
+    async function saveDataSources() {
+      const items = document.querySelectorAll('#sourcesList > div span:first-child');
+      const sources = Array.from(items).map(span => span.textContent.trim());
+      
+      if (sources.length === 0) {
+        if (!confirm('数据源列表为空，将恢复默认数据源。确定吗？')) {
+          return;
+        }
+      }
+      
+      const btn = event.target;
+      const originalText = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = '保存中...';
+      
+      try {
+        const res = await fetch('/api/save-data-sources', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sources })
+        });
+        
+        const data = await res.json();
+        
+        if (data.success) {
+          alert(\`数据源保存成功！共 \${data.sources.length} 个源，将立即刷新IP列表\`);
+          setTimeout(() => {
+            window.location.reload();
+          }, 1500);
+        } else {
+          alert('保存失败: ' + (data.error || '未知错误'));
+        }
+      } catch (e) {
+        alert('保存失败: ' + e.message);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = originalText;
+      }
+    }
+
+    async function resetDataSources() {
+      if (!confirm('恢复默认数据源？当前自定义数据源将被清除')) {
+        return;
+      }
+      
+      const btn = event.target;
+      const originalText = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = '恢复中...';
+      
+      try {
+        const res = await fetch('/api/save-data-sources', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sources: [] })
+        });
+        
+        const data = await res.json();
+        
+        if (data.success) {
+          alert('已恢复默认数据源');
+          await loadDataSources();
+          setTimeout(() => {
+            window.location.reload();
+          }, 1500);
+        } else {
+          alert('恢复失败: ' + (data.error || '未知错误'));
+        }
+      } catch (e) {
+        alert('恢复失败: ' + e.message);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = originalText;
+      }
+    }
+
+    async function testDataSource() {
+      const url = document.getElementById('testUrl').value.trim();
+      if (!url) {
+        alert('请输入URL');
+        return;
+      }
+      
+      const resultDiv = document.getElementById('testResult');
+      resultDiv.style.display = 'block';
+      resultDiv.innerHTML = '⏳ 测试中...';
+      resultDiv.style.color = '#94a3b8';
+      
+      try {
+        const res = await fetch('/api/test-data-source', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url })
+        });
+        
+        const data = await res.json();
+        
+        if (data.success) {
+          resultDiv.innerHTML = \`
+            ✅ 测试成功<br>
+            📊 状态码: \${data.status}<br>
+            📝 CIDR数量: \${data.cidrCount}<br>
+            🌐 IP数量: \${data.ipCount}<br>
+            🔍 预览: \${data.preview.join(', ')}\${data.ipCount > 5 ? '...' : ''}
+          \`;
+          resultDiv.style.color = '#4ade80';
+        } else {
+          resultDiv.innerHTML = \`❌ 测试失败: \${data.error}\`;
+          resultDiv.style.color = '#f87171';
+        }
+      } catch (e) {
+        resultDiv.innerHTML = \`❌ 测试异常: \${e.message}\`;
+        resultDiv.style.color = '#f87171';
+      }
+    }
+
+    function escapeHtml(text) {
+      const div = document.createElement('div');
+      div.textContent = text;
+      return div.innerHTML;
+    }
+
     async function loadConfig() {
       try {
         const res = await fetch('/api/get-config');
@@ -2777,6 +3078,7 @@ function getSettingsHTML(env) {
     window.onload = () => {
       loadConfig();
       loadAdvancedConfig();
+      loadDataSources();
     };
   </script>
 </body>
