@@ -188,6 +188,8 @@ function cleanupIpBandwidthTestCache() {
 
 let writeQueue = [];
 let writeTimer = null;
+let logQueue = [];
+let logTimer = null;
 let bandwidthTestCount = 0;
 let lastBandwidthTestReset = Date.now();
 
@@ -510,11 +512,35 @@ async function addSystemLog(env, message, level = 'info', category = 'system') {
   const now = new Date();
   const timeStr = now.toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false });
   
-  // 立即实时写入日志，不使用批处理
+  // 只有测速相关的日志使用批处理，其他日志立即写入
+  if (category === 'speed_test') {
+    logQueue.push({ timeStr, level, category, message });
+    if (logQueue.length >= 10) {
+      await flushLogs(env);
+    } else if (!logTimer) {
+      logTimer = setTimeout(() => flushLogs(env), 2000);
+    }
+  } else {
+    // 立即实时写入日志
+    try {
+      await env.DB.prepare('INSERT INTO system_logs (time_str, level, category, message) VALUES (?, ?, ?, ?)')
+        .bind(timeStr, level, category, message)
+        .run();
+    } catch (e) {
+      console.error('日志写入失败:', e);
+    }
+  }
+}
+
+async function flushLogs(env) {
+  if (logTimer) { clearTimeout(logTimer); logTimer = null; }
+  if (logQueue.length === 0) return;
+  const logs = [...logQueue];
+  logQueue = [];
   try {
-    await env.DB.prepare('INSERT INTO system_logs (time_str, level, category, message) VALUES (?, ?, ?, ?)')
-      .bind(timeStr, level, category, message)
-      .run();
+    const stmt = env.DB.prepare('INSERT INTO system_logs (time_str, level, category, message) VALUES (?, ?, ?, ?)');
+    const operations = logs.map(log => stmt.bind(log.timeStr, log.level, log.category, log.message));
+    if (operations.length > 0) await env.DB.batch(operations);
   } catch (e) {
     console.error('日志写入失败:', e);
   }
@@ -4970,6 +4996,7 @@ export default {
       await cleanHighQualityPool(env);
       await cleanExpiredGeoCache(env);
       await cleanExpiredLogs(env);
+      await flushLogs(env);
       await updateRegionQuality(env);
       
       // 更新IP列表
