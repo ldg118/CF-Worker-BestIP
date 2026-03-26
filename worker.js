@@ -599,12 +599,12 @@ async function getSystemLogs(env, options = {}) {
       params.push('%' + keyword + '%');
     }
     
-    if (level) {
+    if (level && level !== '') {
       query += ' AND level = ?';
       params.push(level);
     }
     
-    if (category) {
+    if (category && category !== '') {
       query += ' AND category = ?';
       params.push(category);
     }
@@ -881,6 +881,10 @@ async function exportLogs(env, options = {}) {
 
 async function getBandwidthPoolIPs(env) {
   try {
+    // 尝试从缓存获取
+    const cached = highQualityCache.get('bandwidth_pool');
+    if (cached) return cached;
+    
     const advancedConfig = await getAdvancedConfig(env);
     const maxPoolSize = advancedConfig.maxHighQualityPoolSize;
     
@@ -891,7 +895,10 @@ async function getBandwidthPoolIPs(env) {
       LIMIT ?
     `).bind(maxPoolSize).all();
     
-    return result.results || [];
+    const ips = result.results || [];
+    // 缓存结果
+    highQualityCache.set('bandwidth_pool', ips);
+    return ips;
   } catch (e) {
     await addSystemLog(env, `❌ getBandwidthPoolIPs 错误: ${e.message}`);
     return [];
@@ -927,6 +934,8 @@ async function addToBandwidthPool(env, ip, latency, bandwidth, geo, score) {
           WHERE ip = ?
         `).bind(latency, bandwidth || null, geo.country, geo.city, ip).run();
         await addSystemLog(env, `🔄 ${ip} 更新带宽池数据 (${latency}ms, ${bandwidth}Mbps, 评分${score})`);
+        // 清除缓存
+        highQualityCache.clear();
       } else {
         // 检查池大小，如果满了则替换带宽最低的IP
         const currentCount = await env.DB.prepare('SELECT COUNT(*) as count FROM high_quality_ips').first();
@@ -948,6 +957,8 @@ async function addToBandwidthPool(env, ip, latency, bandwidth, geo, score) {
         VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 'bandwidth')
       `).bind(ip, latency, bandwidth || null, geo.country, geo.city).run();
       await addSystemLog(env, `✨ ${ip} (${geo.country}) - ${latency}ms, ${bandwidth}Mbps, 评分${score} 已加入带宽池 (优秀带宽直接加入)`);
+      // 清除缓存
+      highQualityCache.clear();
       }
       return;
     }
@@ -962,6 +973,8 @@ async function addToBandwidthPool(env, ip, latency, bandwidth, geo, score) {
           WHERE ip = ?
         `).bind(latency, bandwidth || null, geo.country, geo.city, ip).run();
         await addSystemLog(env, `🔄 ${ip} 更新带宽池数据 (${latency}ms, ${bandwidth || 0}Mbps, 评分${score})`);
+        // 清除缓存
+        highQualityCache.clear();
         return;
       }
       
@@ -997,6 +1010,8 @@ async function addToBandwidthPool(env, ip, latency, bandwidth, geo, score) {
         `).bind(ip, latency, bandwidth || null, geo.country, geo.city).run();
         const newCount = await env.DB.prepare('SELECT COUNT(*) as count FROM high_quality_ips').first();
         await addSystemLog(env, `✨ ${ip} (${geo.country}) - ${latency}ms, ${bandwidth || 0}Mbps, 评分${score} 已加入带宽池 (${newCount.count}/${maxPoolSize})`);
+        // 清除缓存
+        highQualityCache.clear();
       } else {
         // 带宽优质池已满且当前IP带宽不高于池中所有IP，添加到备用池
         await addToBackupPool(env, ip, latency, bandwidth, geo, score);
@@ -1701,9 +1716,17 @@ async function getTotalIPCount(env) {
 
 async function getAllIPs(env) {
   try {
+    // 尝试从缓存获取
+    const cached = highQualityCache.get('all_ips');
+    if (cached) return cached;
+    
     const ips = await env.KV.get(CONFIG.kvKeys.ipList, 'json') || [];
     const customIPs = await env.KV.get(CONFIG.kvKeys.customIPs, 'json') || [];
-    return [...new Set([...ips, ...customIPs])];
+    const result = [...new Set([...ips, ...customIPs])];
+    
+    // 缓存结果
+    highQualityCache.set('all_ips', result);
+    return result;
   } catch (e) { return []; }
 }
 
@@ -1746,6 +1769,8 @@ async function updateIPs(env) {
   const ipList = Array.from(allIPs).sort(compareIPs);
   await env.KV.put(CONFIG.kvKeys.ipList, JSON.stringify(ipList));
   await env.KV.put(CONFIG.kvKeys.lastUpdate, new Date().toLocaleString('zh-CN'));
+  // 清除缓存
+  highQualityCache.clear();
   await addSystemLog(env, `🔄 IP列表已更新: ${ipList.length} 个IP`);
   return ipList;
 }
