@@ -516,9 +516,19 @@ async function addSystemLog(env, message, level = 'info', category = 'system') {
   if (category === 'speed_test') {
     logQueue.push({ timeStr, level, category, message });
     if (logQueue.length >= 10) {
-      await flushLogs(env);
+      try {
+        await flushLogs(env);
+      } catch (e) {
+        console.error('批处理日志写入失败:', e);
+      }
     } else if (!logTimer) {
-      logTimer = setTimeout(() => flushLogs(env), 2000);
+      logTimer = setTimeout(async () => {
+        try {
+          await flushLogs(env);
+        } catch (e) {
+          console.error('定时器批处理日志写入失败:', e);
+        }
+      }, 2000);
     }
   } else {
     // 立即实时写入日志
