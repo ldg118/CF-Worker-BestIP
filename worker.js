@@ -512,6 +512,12 @@ async function addSystemLog(env, message, level = 'info', category = 'system') {
   const now = new Date();
   const timeStr = now.toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false });
   
+  // 检查 env.DB 是否存在
+  if (!env.DB) {
+    console.error('数据库连接不存在，无法写入日志:', message);
+    return;
+  }
+  
   // 只有测速相关的日志使用批处理，其他日志立即写入
   if (category === 'speed_test') {
     logQueue.push({ timeStr, level, category, message });
@@ -545,6 +551,14 @@ async function addSystemLog(env, message, level = 'info', category = 'system') {
 async function flushLogs(env) {
   if (logTimer) { clearTimeout(logTimer); logTimer = null; }
   if (logQueue.length === 0) return;
+  
+  // 检查 env.DB 是否存在
+  if (!env.DB) {
+    console.error('数据库连接不存在，无法写入日志');
+    logQueue = []; // 清空队列，避免重复尝试
+    return;
+  }
+  
   const logs = [...logQueue];
   logQueue = [];
   try {
@@ -559,6 +573,12 @@ async function flushLogs(env) {
 
 
 async function getSystemLogs(env, options = {}) {
+  // 检查 env.DB 是否存在
+  if (!env.DB) {
+    console.error('数据库连接不存在，无法获取日志');
+    return [];
+  }
+  
   try {
     const { startDate, endDate, keyword, level, category, limit = 100 } = options;
     let query = 'SELECT time_str, level, category, message FROM system_logs WHERE 1=1';
@@ -607,6 +627,12 @@ async function getSystemLogs(env, options = {}) {
 }
 
 async function initDatabase(env) {
+  // 检查 env.DB 是否存在
+  if (!env.DB) {
+    console.error('数据库连接不存在，无法初始化数据库');
+    return false;
+  }
+  
   try {
     const statements = INIT_SQL.split(';').filter(s => s.trim());
     for (const stmt of statements) {
@@ -619,6 +645,12 @@ async function initDatabase(env) {
 }
 
 async function runD1Migrations(env) {
+  // 检查 env.DB 是否存在
+  if (!env.DB) {
+    console.error('数据库连接不存在，无法运行数据库迁移');
+    return;
+  }
+  
   const steps = [
     `ALTER TABLE speed_strategy ADD COLUMN quality_mode TEXT DEFAULT 'bandwidth'`,
     `ALTER TABLE high_quality_ips ADD COLUMN quality_type TEXT DEFAULT 'bandwidth'`,
@@ -653,14 +685,17 @@ async function getIPGeo(env, ip) {
   const cached = geoCache.get(ip);
   if (cached) return cached;
   
-  try {
-    const dbCached = await env.DB.prepare('SELECT country, country_name, city FROM ip_geo_cache WHERE ip = ?').bind(ip).first();
-    if (dbCached && dbCached.country) {
-      const geo = { country: dbCached.country, countryName: dbCached.country_name, city: dbCached.city };
-      geoCache.set(ip, geo);
-      return geo;
-    }
-  } catch (e) {}
+  // 检查 env.DB 是否存在
+  if (env.DB) {
+    try {
+      const dbCached = await env.DB.prepare('SELECT country, country_name, city FROM ip_geo_cache WHERE ip = ?').bind(ip).first();
+      if (dbCached && dbCached.country) {
+        const geo = { country: dbCached.country, countryName: dbCached.country_name, city: dbCached.city };
+        geoCache.set(ip, geo);
+        return geo;
+      }
+    } catch (e) {}
+  }
   
   // 优先使用 ipapi.co（免费、准确）
   try {
@@ -673,8 +708,10 @@ async function getIPGeo(env, ip) {
           countryName: data.country_name || data.country || '', 
           city: data.city || '' 
         };
-        env.DB.prepare('INSERT OR REPLACE INTO ip_geo_cache (ip, country, country_name, city, cached_at) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)')
-          .bind(ip, geo.country, geo.countryName, geo.city).run().catch(() => {});
+        if (env.DB) {
+          env.DB.prepare('INSERT OR REPLACE INTO ip_geo_cache (ip, country, country_name, city, cached_at) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)')
+            .bind(ip, geo.country, geo.countryName, geo.city).run().catch(() => {});
+        }
         geoCache.set(ip, geo);
         return geo;
       }
@@ -688,8 +725,10 @@ async function getIPGeo(env, ip) {
       const data = await resp.json();
       if (data.status === 'success' && data.countryCode) {
         const geo = { country: data.countryCode, countryName: data.country, city: data.city || '' };
-        env.DB.prepare('INSERT OR REPLACE INTO ip_geo_cache (ip, country, country_name, city, cached_at) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)')
-          .bind(ip, geo.country, geo.countryName, geo.city).run().catch(() => {});
+        if (env.DB) {
+          env.DB.prepare('INSERT OR REPLACE INTO ip_geo_cache (ip, country, country_name, city, cached_at) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)')
+            .bind(ip, geo.country, geo.countryName, geo.city).run().catch(() => {});
+        }
         geoCache.set(ip, geo);
         return geo;
       }
@@ -707,8 +746,10 @@ async function getIPGeo(env, ip) {
           countryName: data.country || '', 
           city: data.city || '' 
         };
-        env.DB.prepare('INSERT OR REPLACE INTO ip_geo_cache (ip, country, country_name, city, cached_at) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)')
-          .bind(ip, geo.country, geo.countryName, geo.city).run().catch(() => {});
+        if (env.DB) {
+          env.DB.prepare('INSERT OR REPLACE INTO ip_geo_cache (ip, country, country_name, city, cached_at) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)')
+            .bind(ip, geo.country, geo.countryName, geo.city).run().catch(() => {});
+        }
         geoCache.set(ip, geo);
         return geo;
       }
@@ -731,13 +772,21 @@ async function getIPGeo(env, ip) {
   }
   
   const geo = { country: guessedCountry, countryName: guessedCountryName, city: '' };
-  env.DB.prepare('INSERT OR REPLACE INTO ip_geo_cache (ip, country, country_name, city, cached_at) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)')
-    .bind(ip, geo.country, geo.countryName, geo.city).run().catch(() => {});
+  if (env.DB) {
+    env.DB.prepare('INSERT OR REPLACE INTO ip_geo_cache (ip, country, country_name, city, cached_at) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)')
+      .bind(ip, geo.country, geo.countryName, geo.city).run().catch(() => {});
+  }
   geoCache.set(ip, geo);
   return geo;
 }
 
 async function addFailedIP(env, ip) {
+  // 检查 env.DB 是否存在
+  if (!env.DB) {
+    console.error('数据库连接不存在，无法添加失败IP');
+    return;
+  }
+  
   try {
     await env.DB.prepare('INSERT OR REPLACE INTO failed_ips (ip, failed_at) VALUES (?, CURRENT_TIMESTAMP)').bind(ip).run();
     await env.DB.prepare('DELETE FROM high_quality_ips WHERE ip = ?').bind(ip).run();
@@ -746,6 +795,12 @@ async function addFailedIP(env, ip) {
 }
 
 async function getFailedIPCount(env) {
+  // 检查 env.DB 是否存在
+  if (!env.DB) {
+    console.error('数据库连接不存在，无法获取失败IP数量');
+    return 0;
+  }
+  
   try {
     const result = await env.DB.prepare('SELECT COUNT(*) as count FROM failed_ips').first();
     return result ? result.count : 0;
@@ -753,6 +808,12 @@ async function getFailedIPCount(env) {
 }
 
 async function cleanExpiredFailedIPs(env) {
+  // 检查 env.DB 是否存在
+  if (!env.DB) {
+    console.error('数据库连接不存在，无法清理过期失败IP');
+    return;
+  }
+  
   try {
     const advancedConfig = await getAdvancedConfig(env);
     await env.DB.prepare(`DELETE FROM failed_ips WHERE julianday('now') - julianday(failed_at) > ?`).bind(advancedConfig.failedIpCooldownDays).run();
@@ -760,6 +821,12 @@ async function cleanExpiredFailedIPs(env) {
 }
 
 async function cleanExpiredGeoCache(env) {
+  // 检查 env.DB 是否存在
+  if (!env.DB) {
+    console.error('数据库连接不存在，无法清理过期地理位置缓存');
+    return;
+  }
+  
   try {
     await env.DB.prepare(`DELETE FROM ip_geo_cache WHERE julianday('now') - julianday(cached_at) > 30`).run();
     geoCache.clear();
@@ -775,6 +842,12 @@ async function getLogConfig(env) {
 }
 
 async function cleanExpiredLogs(env) {
+  // 检查 env.DB 是否存在
+  if (!env.DB) {
+    console.error('数据库连接不存在，无法清理过期日志');
+    return;
+  }
+  
   try {
     const logConfig = await getLogConfig(env);
     if (logConfig.autoClean) {
@@ -3300,6 +3373,9 @@ async function getMainHTML(env) {
       
       const url = '/api/get-logs?' + params.toString();
       const res = await fetch(url);
+      if (!res.ok) {
+        throw new Error('API请求失败: ' + res.status);
+      }
       const data = await res.json();
       const panel = document.getElementById('logPanel');
       
@@ -3321,17 +3397,35 @@ async function getMainHTML(env) {
       } else {
         panel.innerHTML = '<div class="log-entry">暂无日志</div>';
       }
-    } catch(e) {}
+    } catch(e) {
+      console.error('加载日志失败:', e);
+      showToast('加载日志失败: ' + e.message, 'error');
+    }
   }
   
   async function clearLogs() {
     showConfirm('清除所有日志？', async () => {
-      await fetch('/api/clear-logs', { method: 'POST' });
-      await loadLogs();
+      try {
+        const res = await fetch('/api/clear-logs', { method: 'POST' });
+        if (!res.ok) {
+          throw new Error('API请求失败: ' + res.status);
+        }
+        await loadLogs();
+        showToast('日志清除成功', 'success');
+      } catch(e) {
+        console.error('清除日志失败:', e);
+        showToast('清除日志失败: ' + e.message, 'error');
+      }
     });
   }
   
-  async function refreshLogs() { await loadLogs(); }
+  async function refreshLogs() { 
+    try {
+      await loadLogs();
+    } catch(e) {
+      console.error('刷新日志失败:', e);
+    }
+  }
   
   async function exportLogs() {
     try {
@@ -3358,9 +3452,10 @@ async function getMainHTML(env) {
         URL.revokeObjectURL(url);
         showToast('日志导出成功', 'success');
       } else {
-        showToast('导出失败', 'error');
+        throw new Error('API请求失败: ' + res.status);
       }
     } catch(e) {
+      console.error('导出日志失败:', e);
       showToast('导出失败: ' + e.message, 'error');
     }
   }
@@ -4516,7 +4611,7 @@ function getSettingsHTML(env) {
   }
   
   window.countryNames = ${JSON.stringify(COUNTRY_NAMES)};
-  window.onload = async () => { await loadDataSources(); await loadConfig(); await loadCustomIPs(); await loadLogConfig(); };
+
 </script>
 </body>
 </html>`;
@@ -4528,10 +4623,14 @@ export default {
     const path = url.pathname;
     const config = getEnvConfig(env);
 
-    ctx.waitUntil((async () => {
+    // 同步初始化数据库，确保表结构存在
+    try {
       await initDatabase(env);
       await runD1Migrations(env);
-    })().catch(() => {}));
+    } catch (e) {
+      console.error('数据库初始化失败:', e);
+    }
+
     ctx.waitUntil(cleanExpiredFailedIPs(env).catch(() => {}));
     ctx.waitUntil(cleanExpiredGeoCache(env).catch(() => {}));
     ctx.waitUntil(cleanExpiredLogs(env).catch(() => {}));
