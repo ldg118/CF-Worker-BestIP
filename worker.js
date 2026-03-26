@@ -1333,7 +1333,6 @@ async function smartSpeedTest(env, options = {}, ctx = null) {
     
     // 分离IP池
     const bandwidthPoolIPSet = new Set(bandwidthPoolIPs.map(ip => ip.ip));
-    const latencyPoolIPSet = new Set(latencyPoolIPs.map(ip => ip.ip));
     const newIPs = allIPs.filter(ip => !existingIPs.has(ip));
     
     // 构建测试队列
@@ -4984,6 +4983,11 @@ export default {
       await cleanExpiredLogs(env);
       await flushLogs(env);
       await updateRegionQuality(env);
+      
+      // 更新IP列表
+      await addSystemLog(env, `🔄 开始更新IP列表`);
+      await updateIPs(env);
+      await addSystemLog(env, `✅ IP列表更新完成`);
       
       const strategy = await getSpeedStrategy(env);
       let targetCountry = null;
