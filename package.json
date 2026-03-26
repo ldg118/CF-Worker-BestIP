@@ -1,0 +1,23 @@
+{
+  "name": "cf-best-ip",
+  "version": "1.0.0",
+  "description": "基于 Cloudflare Workers 的 IP 优选工具",
+  "main": "src/worker.js",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "build": "echo 'Build completed'"
+  },
+  "keywords": [
+    "cloudflare",
+    "workers",
+    "ip",
+    "speed-test",
+    "dns"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "wrangler": "^3.0.0"
+  }
+}

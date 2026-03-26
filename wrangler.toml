@@ -1,0 +1,30 @@
+name = "cf-best-ip"
+main = "worker.js"
+compatibility_date = "2024-01-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "cf-best-ip-db"
+database_id = "YOUR_DATABASE_ID"
+
+[[kv_namespaces]]
+binding = "KV"
+id = "YOUR_KV_NAMESPACE_ID"
+preview_id = "YOUR_KV_NAMESPACE_ID"
+
+[vars]
+ADMIN_PASSWORD = "123"
+DEFAULT_IP_COUNT = "3"
+DEFAULT_TEST_COUNT = "50"
+DEFAULT_THREAD_COUNT = "10"
+DEFAULT_BANDWIDTH_FILE_SIZE = "3"
+FAILED_IP_COOLDOWN_DAYS = "15"
+MAX_HIGH_QUALITY_POOL_SIZE = "30"
+
+[triggers]
+cron = [
+  {
+    schedule = "0 * * * *",
+    inputs = { cron = true }
+  }
+]
