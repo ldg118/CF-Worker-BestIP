@@ -487,6 +487,77 @@ Cloudflare Pages 也支持部署 Workers Functions，适合需要同时部署静
 | `README.md`             | 项目文档，包含部署和使用说明                    |
 | `.gitignore`            | Git 忽略文件，指定不需要版本控制的文件             |
 
+### 代码模块结构
+
+```
+worker.js
+├── 常量定义
+│   ├── CONFIG                    # 全局配置常量
+│   ├── BANDWIDTH_LEVELS          # 带宽等级定义
+│   └── COUNTRY_NAMES             # 国家/地区名称映射
+│
+├── 工具模块
+│   ├── IPUtils                   # IP验证和处理工具
+│   │   ├── isValid()             # 验证IPv4地址
+│   │   ├── isValidCIDR()         # 验证CIDR网段
+│   │   ├── expandCIDR()          # 展开CIDR为IP列表
+│   │   ├── increment()           # IP地址递增
+│   │   └── compare()             # IP地址比较
+│   │
+│   ├── Utils                     # 通用工具函数
+│   │   ├── emoji.latency()       # 延迟表情符号
+│   │   ├── emoji.bandwidth()     # 带宽表情符号
+│   │   ├── format.maskIP()       # IP地址脱敏
+│   │   ├── format.sourceText()   # 数据源文本转换
+│   │   └── text.escapeMarkdown() # Markdown转义
+│   │
+│   ├── SessionManager            # 会话管理模块
+│   │   ├── extractId()           # 提取会话ID
+│   │   ├── verify()              # 验证会话有效性
+│   │   ├── login()               # 处理登录
+│   │   └── logout()              # 处理登出
+│   │
+│   └── LogManager                # 日志管理模块
+│       ├── add()                 # 添加日志（支持批量）
+│       ├── flush()               # 刷新日志到数据库
+│       └── get()                 # 获取日志列表
+│
+├── 配置模块
+│   └── getConfig()               # 通用配置获取函数
+│       ├── 'advanced'            # 高级配置
+│       ├── 'log'                 # 日志配置
+│       └── 'quality'             # 质量模式配置
+│
+├── 池操作模块
+│   ├── checkInPool()             # 检查IP是否在池中
+│   ├── addToPool()               # 添加IP到指定池
+│   └── cleanPool()               # 清理过期IP
+│
+├── 数据处理模块
+│   ├── updateRegionData()        # 更新区域统计数据
+│   └── handleDataQuery()         # 处理数据查询请求
+│
+├── 测速模块
+│   ├── speedTestWithBandwidth()  # 带宽测试
+│   └── smartSpeedTest()          # 智能测速策略
+│
+├── DNS管理模块
+│   ├── updateDNSBatch()          # 批量更新DNS
+│   └── updateDNSWithVisitorAware() # 访客感知DNS更新
+│
+└── 前端渲染模块
+    ├── getLoginHTML()            # 登录页面
+    ├── getMainHTML()             # 主操作页面
+    └── getSettingsHTML()         # 设置页面
+```
+
+### 模块设计特点
+
+1. **命名空间组织**：使用 `IPUtils`、`Utils` 等命名空间组织相关工具函数，代码更清晰
+2. **模块封装**：`SessionManager`、`LogManager` 等模块封装内部状态，避免全局变量污染
+3. **通用函数抽象**：`getConfig`、`checkInPool` 等函数通过参数支持多种类型，减少重复代码
+4. **向后兼容**：所有原有函数调用保持兼容，无需修改现有代码
+
 ## 常见问题
 
 ### Q: 登录后显示 401 未授权？

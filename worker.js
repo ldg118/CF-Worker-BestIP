@@ -94,8 +94,6 @@ CREATE TABLE IF NOT EXISTS failed_ips (
 CREATE TABLE IF NOT EXISTS system_logs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   time_str TEXT NOT NULL,
-  level TEXT DEFAULT 'info',
-  category TEXT DEFAULT 'system',
   message TEXT NOT NULL
 );
 
@@ -188,8 +186,6 @@ function cleanupIpBandwidthTestCache() {
 
 let writeQueue = [];
 let writeTimer = null;
-let logQueue = [];
-let logTimer = null;
 let bandwidthTestCount = 0;
 let lastBandwidthTestReset = Date.now();
 
@@ -275,6 +271,15 @@ function compareIPs(a, b) {
   return 0;
 }
 
+// IP工具命名空间
+const IPUtils = {
+  isValid: isValidIPv4,
+  isValidCIDR,
+  expandCIDR,
+  increment: incrementIP,
+  compare: compareIPs
+};
+
 function generateSessionId() {
   return Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
 }
@@ -295,13 +300,94 @@ function getSourceText(source) {
   return sourceMap[source] || source;
 }
 
-function getSessionId(request) {
-  const cookie = request.headers.get('Cookie');
-  if (cookie) {
-    const match = cookie.match(/sessionId=([^;]+)/);
-    if (match) return match[1];
+// 通用工具命名空间
+const Utils = {
+  emoji: {
+    latency: getLatencyEmoji,
+    bandwidth: getBandwidthEmoji
+  },
+  format: {
+    maskIP,
+    sourceText: getSourceText,
+    escapeMarkdown: escapeMarkdownV2
+  },
+  text: {
+    escapeMarkdown: escapeMarkdownV2
   }
-  return null;
+};
+
+// 会话管理模块
+const SessionManager = {
+  // 从请求中提取会话ID
+  extractId(request) {
+    const cookie = request.headers.get('Cookie');
+    if (cookie) {
+      const match = cookie.match(/sessionId=([^;]+)/);
+      if (match) return match[1];
+    }
+    return null;
+  },
+  
+  // 验证会话是否有效
+  async verify(sessionId, env) {
+    if (!sessionId) return false;
+    try {
+      const sessions = await env.KV.get(CONFIG.kvKeys.sessions, 'json');
+      return sessions && sessions[sessionId];
+    } catch { return false; }
+  },
+  
+  // 处理登录
+  async login(request, env) {
+    try {
+      const { password } = await request.json();
+      const config = getEnvConfig(env);
+      if (!config.adminPassword) {
+        return new Response(JSON.stringify({ success: false, error: '管理员密码未配置' }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+      }
+      if (password === config.adminPassword) {
+        const sessionId = generateSessionId();
+        const sessions = await env.KV.get(CONFIG.kvKeys.sessions, 'json') || {};
+        sessions[sessionId] = { createdAt: Date.now() };
+        await env.KV.put(CONFIG.kvKeys.sessions, JSON.stringify(sessions));
+        await addSystemLog(env, '🔐 管理员登录成功');
+        return new Response(JSON.stringify({ success: true, sessionId }), { headers: { 'Content-Type': 'application/json' } });
+      } else {
+        return new Response(JSON.stringify({ success: false, error: '密码错误' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
+      }
+    } catch (error) {
+      return new Response(JSON.stringify({ success: false, error: error.message }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+    }
+  },
+  
+  // 处理登出
+  async logout(request, env) {
+    const sessionId = this.extractId(request);
+    if (sessionId) {
+      const sessions = await env.KV.get(CONFIG.kvKeys.sessions, 'json') || {};
+      delete sessions[sessionId];
+      await env.KV.put(CONFIG.kvKeys.sessions, JSON.stringify(sessions));
+      await addSystemLog(env, '🔓 管理员登出');
+    }
+    return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
+  }
+};
+
+// 兼容性别名
+function getSessionId(request) {
+  return SessionManager.extractId(request);
+}
+
+async function verifySession(sessionId, env) {
+  return SessionManager.verify(sessionId, env);
+}
+
+async function handleLogin(request, env) {
+  return SessionManager.login(request, env);
+}
+
+async function handleLogout(request, env) {
+  return SessionManager.logout(request, env);
 }
 
 
@@ -381,7 +467,7 @@ async function sendTelegramNotification(env, { message, hideIP = true, type = 'i
   const dnsConfig = await env.KV.get(CONFIG.kvKeys.dnsConfig, 'json') || {};
   
   if (!dnsConfig.telegramEnabled) {
-    await addSystemLog(env, `Telegram通知未启用`, 'info', 'telegram');
+    await addSystemLog(env, `ℹ️ Telegram通知未启用`);
     return;
   }
   
@@ -389,7 +475,7 @@ async function sendTelegramNotification(env, { message, hideIP = true, type = 'i
   const chatId = dnsConfig.telegramChatId;
   
   if (!botToken || !chatId) {
-    await addSystemLog(env, `Telegram配置不完整`, 'warning', 'telegram');
+    await addSystemLog(env, `ℹ️ Telegram配置不完整`);
     return;
   }
   
@@ -469,14 +555,14 @@ ${idx + 1}. <code>${ipDisplay}</code>
     
     if (!response.ok) {
       const errorText = await response.text().catch(() => '未知错误');
-      await addSystemLog(env, `Telegram通知发送失败: ${response.status} - ${errorText}`, 'error', 'telegram');
+      await addSystemLog(env, `❌ Telegram通知发送失败: ${response.status} - ${errorText}`);
     } else {
-      await addSystemLog(env, `Telegram通知发送成功`, 'info', 'telegram');
+      await addSystemLog(env, `✅ Telegram通知发送成功`);
     }
     
     return await response.json();
   } catch (error) {
-    await addSystemLog(env, `Telegram通知异常: ${error.message}`, 'error', 'telegram');
+    await addSystemLog(env, `❌ Telegram通知异常: ${error.message}`);
     console.error('Telegram发送失败:', error);
   }
 }
@@ -508,131 +594,59 @@ function maskIP(ip) {
   return ip;
 }
 
-async function addSystemLog(env, message, level = 'info', category = 'system') {
-  const now = new Date();
-  const timeStr = now.toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false });
+// 日志管理模块
+const LogManager = {
+  queue: [],
+  timer: null,
   
-  // 检查 env.DB 是否存在
-  if (!env.DB) {
-    console.error('数据库连接不存在，无法写入日志:', message);
-    return;
-  }
-  
-  // 只有测速相关的日志使用批处理，其他日志立即写入
-  if (category === 'speed_test') {
-    logQueue.push({ timeStr, level, category, message });
-    if (logQueue.length >= 10) {
-      try {
-        await flushLogs(env);
-      } catch (e) {
-        console.error('批处理日志写入失败:', e);
-      }
-    } else if (!logTimer) {
-      logTimer = setTimeout(async () => {
-        try {
-          await flushLogs(env);
-        } catch (e) {
-          console.error('定时器批处理日志写入失败:', e);
-        }
-      }, 2000);
+  // 添加系统日志
+  async add(env, message) {
+    const now = new Date();
+    const timeStr = now.toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false });
+    this.queue.push({ timeStr, message });
+    if (this.queue.length >= 20) {
+      await this.flush(env);
+    } else if (!this.timer) {
+      this.timer = setTimeout(() => this.flush(env), 5000);
     }
-  } else {
-    // 立即实时写入日志
+  },
+  
+  // 刷新日志到数据库
+  async flush(env) {
+    if (this.timer) { clearTimeout(this.timer); this.timer = null; }
+    if (this.queue.length === 0) return;
+    const logs = [...this.queue];
+    this.queue = [];
     try {
-      await env.DB.prepare('INSERT INTO system_logs (time_str, level, category, message) VALUES (?, ?, ?, ?)')
-        .bind(timeStr, level, category, message)
-        .run();
-    } catch (e) {
-      console.error('日志写入失败:', e);
-    }
+      const stmt = env.DB.prepare('INSERT INTO system_logs (time_str, message) VALUES (?, ?)');
+      const operations = logs.map(log => stmt.bind(log.timeStr, log.message));
+      if (operations.length > 0) await env.DB.batch(operations);
+    } catch (e) {}
+  },
+  
+  // 获取系统日志
+  async get(env, limit = 100) {
+    try {
+      const result = await env.DB.prepare('SELECT time_str, message FROM system_logs ORDER BY id DESC LIMIT ?').bind(limit).all();
+      return (result.results || []).map(row => ({ timeStr: row.time_str, message: row.message }));
+    } catch (e) { return []; }
   }
+};
+
+// 兼容性别名
+async function addSystemLog(env, message) {
+  return LogManager.add(env, message);
 }
 
 async function flushLogs(env) {
-  if (logTimer) { clearTimeout(logTimer); logTimer = null; }
-  if (logQueue.length === 0) return;
-  
-  // 检查 env.DB 是否存在
-  if (!env.DB) {
-    console.error('数据库连接不存在，无法写入日志');
-    logQueue = []; // 清空队列，避免重复尝试
-    return;
-  }
-  
-  const logs = [...logQueue];
-  logQueue = [];
-  try {
-    const stmt = env.DB.prepare('INSERT INTO system_logs (time_str, level, category, message) VALUES (?, ?, ?, ?)');
-    const operations = logs.map(log => stmt.bind(log.timeStr, log.level, log.category, log.message));
-    if (operations.length > 0) await env.DB.batch(operations);
-  } catch (e) {
-    console.error('日志写入失败:', e);
-  }
+  return LogManager.flush(env);
 }
 
-
-
-async function getSystemLogs(env, options = {}) {
-  // 检查 env.DB 是否存在
-  if (!env.DB) {
-    console.error('数据库连接不存在，无法获取日志');
-    return [];
-  }
-  
-  try {
-    const { startDate, endDate, keyword, level, category, limit = 100 } = options;
-    let query = 'SELECT time_str, level, category, message FROM system_logs WHERE 1=1';
-    const params = [];
-    
-    if (startDate) {
-      query += ' AND datetime(substr(time_str, 1, 10) || " " || substr(time_str, 12), "localtime") >= datetime(?)';
-      params.push(startDate);
-    }
-    
-    if (endDate) {
-      query += ' AND datetime(substr(time_str, 1, 10) || " " || substr(time_str, 12), "localtime") <= datetime(?)';
-      params.push(endDate);
-    }
-    
-    if (keyword) {
-      query += ' AND message LIKE ?';
-      params.push('%' + keyword + '%');
-    }
-    
-    if (level && level !== '') {
-      query += ' AND level = ?';
-      params.push(level);
-    }
-    
-    if (category && category !== '') {
-      query += ' AND category = ?';
-      params.push(category);
-    }
-    
-    query += ' ORDER BY time_str DESC LIMIT ?';
-    params.push(limit);
-    
-    const stmt = env.DB.prepare(query);
-    const result = await stmt.bind(...params).all();
-    return (result.results || []).map(row => ({
-      timeStr: row.time_str,
-      level: row.level,
-      category: row.category,
-      message: row.message
-    }));
-  } catch (e) {
-    console.error('获取日志失败:', e);
-    return [];
-  }
+async function getSystemLogs(env) {
+  return LogManager.get(env);
 }
 
 async function initDatabase(env) {
-  // 检查 env.DB 是否存在
-  if (!env.DB) {
-    console.error('数据库连接不存在，无法初始化数据库');
-    return false;
-  }
-  
   try {
     const statements = INIT_SQL.split(';').filter(s => s.trim());
     for (const stmt of statements) {
@@ -645,12 +659,6 @@ async function initDatabase(env) {
 }
 
 async function runD1Migrations(env) {
-  // 检查 env.DB 是否存在
-  if (!env.DB) {
-    console.error('数据库连接不存在，无法运行数据库迁移');
-    return;
-  }
-  
   const steps = [
     `ALTER TABLE speed_strategy ADD COLUMN quality_mode TEXT DEFAULT 'bandwidth'`,
     `ALTER TABLE high_quality_ips ADD COLUMN quality_type TEXT DEFAULT 'bandwidth'`,
@@ -660,13 +668,51 @@ async function runD1Migrations(env) {
   }
 }
 
+// 通用配置获取函数
+async function getConfig(env, type) {
+  switch (type) {
+    case 'advanced': {
+      const savedConfig = await env.KV.get(CONFIG.kvKeys.advancedConfig, 'json') || {};
+      const envConfig = getEnvConfig(env);
+      return {
+        maxHighQualityPoolSize: savedConfig.maxHighQualityPoolSize || envConfig.maxHighQualityPoolSize,
+        failedIpCooldownDays: savedConfig.failedIpCooldownDays || envConfig.failedIpCooldownDays
+      };
+    }
+    
+    case 'log': {
+      const savedConfig = await env.KV.get(CONFIG.kvKeys.logConfig, 'json') || {};
+      return {
+        autoClean: savedConfig.autoClean !== false,
+        cleanDays: Math.min(7, Math.max(3, parseInt(savedConfig.cleanDays) || 7))
+      };
+    }
+    
+    case 'quality': {
+      const strategy = await env.DB.prepare('SELECT quality_mode FROM speed_strategy WHERE id = 1').first();
+      if (!strategy) {
+        await env.DB.prepare(`INSERT INTO speed_strategy (id, quality_mode) VALUES (1, 'bandwidth')`).run();
+        return 'bandwidth';
+      }
+      return strategy.quality_mode || 'bandwidth';
+    }
+    
+    default:
+      throw new Error(`Unknown config type: ${type}`);
+  }
+}
+
+// 兼容性别名
 async function getAdvancedConfig(env) {
-  const savedConfig = await env.KV.get(CONFIG.kvKeys.advancedConfig, 'json') || {};
-  const envConfig = getEnvConfig(env);
-  return {
-    maxHighQualityPoolSize: savedConfig.maxHighQualityPoolSize || envConfig.maxHighQualityPoolSize,
-    failedIpCooldownDays: savedConfig.failedIpCooldownDays || envConfig.failedIpCooldownDays
-  };
+  return getConfig(env, 'advanced');
+}
+
+async function getLogConfig(env) {
+  return getConfig(env, 'log');
+}
+
+async function getQualityMode(env) {
+  return getConfig(env, 'quality');
 }
 
 function getEnvConfig(env) {
@@ -685,17 +731,14 @@ async function getIPGeo(env, ip) {
   const cached = geoCache.get(ip);
   if (cached) return cached;
   
-  // 检查 env.DB 是否存在
-  if (env.DB) {
-    try {
-      const dbCached = await env.DB.prepare('SELECT country, country_name, city FROM ip_geo_cache WHERE ip = ?').bind(ip).first();
-      if (dbCached && dbCached.country) {
-        const geo = { country: dbCached.country, countryName: dbCached.country_name, city: dbCached.city };
-        geoCache.set(ip, geo);
-        return geo;
-      }
-    } catch (e) {}
-  }
+  try {
+    const dbCached = await env.DB.prepare('SELECT country, country_name, city FROM ip_geo_cache WHERE ip = ?').bind(ip).first();
+    if (dbCached && dbCached.country) {
+      const geo = { country: dbCached.country, countryName: dbCached.country_name, city: dbCached.city };
+      geoCache.set(ip, geo);
+      return geo;
+    }
+  } catch (e) {}
   
   // 优先使用 ipapi.co（免费、准确）
   try {
@@ -708,10 +751,8 @@ async function getIPGeo(env, ip) {
           countryName: data.country_name || data.country || '', 
           city: data.city || '' 
         };
-        if (env.DB) {
-          env.DB.prepare('INSERT OR REPLACE INTO ip_geo_cache (ip, country, country_name, city, cached_at) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)')
-            .bind(ip, geo.country, geo.countryName, geo.city).run().catch(() => {});
-        }
+        env.DB.prepare('INSERT OR REPLACE INTO ip_geo_cache (ip, country, country_name, city, cached_at) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)')
+          .bind(ip, geo.country, geo.countryName, geo.city).run().catch(() => {});
         geoCache.set(ip, geo);
         return geo;
       }
@@ -725,10 +766,8 @@ async function getIPGeo(env, ip) {
       const data = await resp.json();
       if (data.status === 'success' && data.countryCode) {
         const geo = { country: data.countryCode, countryName: data.country, city: data.city || '' };
-        if (env.DB) {
-          env.DB.prepare('INSERT OR REPLACE INTO ip_geo_cache (ip, country, country_name, city, cached_at) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)')
-            .bind(ip, geo.country, geo.countryName, geo.city).run().catch(() => {});
-        }
+        env.DB.prepare('INSERT OR REPLACE INTO ip_geo_cache (ip, country, country_name, city, cached_at) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)')
+          .bind(ip, geo.country, geo.countryName, geo.city).run().catch(() => {});
         geoCache.set(ip, geo);
         return geo;
       }
@@ -746,10 +785,8 @@ async function getIPGeo(env, ip) {
           countryName: data.country || '', 
           city: data.city || '' 
         };
-        if (env.DB) {
-          env.DB.prepare('INSERT OR REPLACE INTO ip_geo_cache (ip, country, country_name, city, cached_at) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)')
-            .bind(ip, geo.country, geo.countryName, geo.city).run().catch(() => {});
-        }
+        env.DB.prepare('INSERT OR REPLACE INTO ip_geo_cache (ip, country, country_name, city, cached_at) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)')
+          .bind(ip, geo.country, geo.countryName, geo.city).run().catch(() => {});
         geoCache.set(ip, geo);
         return geo;
       }
@@ -772,21 +809,13 @@ async function getIPGeo(env, ip) {
   }
   
   const geo = { country: guessedCountry, countryName: guessedCountryName, city: '' };
-  if (env.DB) {
-    env.DB.prepare('INSERT OR REPLACE INTO ip_geo_cache (ip, country, country_name, city, cached_at) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)')
-      .bind(ip, geo.country, geo.countryName, geo.city).run().catch(() => {});
-  }
+  env.DB.prepare('INSERT OR REPLACE INTO ip_geo_cache (ip, country, country_name, city, cached_at) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)')
+    .bind(ip, geo.country, geo.countryName, geo.city).run().catch(() => {});
   geoCache.set(ip, geo);
   return geo;
 }
 
 async function addFailedIP(env, ip) {
-  // 检查 env.DB 是否存在
-  if (!env.DB) {
-    console.error('数据库连接不存在，无法添加失败IP');
-    return;
-  }
-  
   try {
     await env.DB.prepare('INSERT OR REPLACE INTO failed_ips (ip, failed_at) VALUES (?, CURRENT_TIMESTAMP)').bind(ip).run();
     await env.DB.prepare('DELETE FROM high_quality_ips WHERE ip = ?').bind(ip).run();
@@ -795,96 +824,63 @@ async function addFailedIP(env, ip) {
 }
 
 async function getFailedIPCount(env) {
-  // 检查 env.DB 是否存在
-  if (!env.DB) {
-    console.error('数据库连接不存在，无法获取失败IP数量');
-    return 0;
-  }
-  
   try {
     const result = await env.DB.prepare('SELECT COUNT(*) as count FROM failed_ips').first();
     return result ? result.count : 0;
   } catch (e) { return 0; }
 }
 
-async function cleanExpiredFailedIPs(env) {
-  // 检查 env.DB 是否存在
-  if (!env.DB) {
-    console.error('数据库连接不存在，无法清理过期失败IP');
-    return;
-  }
-  
+// 通用清理函数
+async function cleanPool(env, config) {
+  const { table, timeField, days, condition, afterClean } = config;
   try {
-    const advancedConfig = await getAdvancedConfig(env);
-    await env.DB.prepare(`DELETE FROM failed_ips WHERE julianday('now') - julianday(failed_at) > ?`).bind(advancedConfig.failedIpCooldownDays).run();
+    if (condition && !condition()) return;
+    
+    let sql;
+    if (table === 'system_logs') {
+      // 日志表使用特殊的日期处理
+      sql = `DELETE FROM ${table} WHERE julianday('now') - julianday(datetime(substr(${timeField}, 1, 10) || ' ' || substr(${timeField}, 12), 'localtime')) > ?`;
+    } else {
+      sql = `DELETE FROM ${table} WHERE julianday('now') - julianday(${timeField}) > ?`;
+    }
+    
+    await env.DB.prepare(sql).bind(days).run();
+    
+    if (afterClean) await afterClean();
   } catch (e) {}
+}
+
+// 兼容性别名函数
+async function cleanExpiredFailedIPs(env) {
+  const advancedConfig = await getAdvancedConfig(env);
+  return cleanPool(env, {
+    table: 'failed_ips',
+    timeField: 'failed_at',
+    days: advancedConfig.failedIpCooldownDays
+  });
 }
 
 async function cleanExpiredGeoCache(env) {
-  // 检查 env.DB 是否存在
-  if (!env.DB) {
-    console.error('数据库连接不存在，无法清理过期地理位置缓存');
-    return;
-  }
-  
-  try {
-    await env.DB.prepare(`DELETE FROM ip_geo_cache WHERE julianday('now') - julianday(cached_at) > 30`).run();
-    geoCache.clear();
-  } catch (e) {}
-}
-
-async function getLogConfig(env) {
-  const savedConfig = await env.KV.get(CONFIG.kvKeys.logConfig, 'json') || {};
-  return {
-    autoClean: savedConfig.autoClean !== false,
-    cleanDays: Math.min(7, Math.max(3, parseInt(savedConfig.cleanDays) || 7))
-  };
+  return cleanPool(env, {
+    table: 'ip_geo_cache',
+    timeField: 'cached_at',
+    days: 30,
+    afterClean: () => geoCache.clear()
+  });
 }
 
 async function cleanExpiredLogs(env) {
-  // 检查 env.DB 是否存在
-  if (!env.DB) {
-    console.error('数据库连接不存在，无法清理过期日志');
-    return;
-  }
-  
-  try {
-    const logConfig = await getLogConfig(env);
-    if (logConfig.autoClean) {
-      await env.DB.prepare(`DELETE FROM system_logs WHERE julianday('now') - julianday(datetime(substr(time_str, 1, 10) || ' ' || substr(time_str, 12), 'localtime')) > ?`).bind(logConfig.cleanDays).run();
-    }
-  } catch (e) {
-    console.error('清理日志失败:', e);
-  }
-}
-
-async function exportLogs(env, options = {}) {
-  try {
-    const logs = await getSystemLogs(env, { ...options, limit: 1000 });
-    
-    // 生成CSV内容
-    let csvContent = '时间,级别,分类,消息\n';
-    logs.forEach(log => {
-      const timeStr = log.timeStr;
-      const level = log.level;
-      const category = log.category;
-      const message = log.message.replace(/"/g, '""'); // 转义双引号
-      csvContent += `"${timeStr}","${level}","${category}","${message}"\n`;
-    });
-    
-    return csvContent;
-  } catch (e) {
-    console.error('导出日志失败:', e);
-    return null;
-  }
+  const logConfig = await getLogConfig(env);
+  return cleanPool(env, {
+    table: 'system_logs',
+    timeField: 'time_str',
+    days: logConfig.cleanDays,
+    condition: () => logConfig.autoClean
+  });
 }
 
 async function getBandwidthPoolIPs(env) {
   try {
-    // 尝试从缓存获取
-    const cached = highQualityCache.get('bandwidth_pool');
-    if (cached) return cached;
-    
     const advancedConfig = await getAdvancedConfig(env);
     const maxPoolSize = advancedConfig.maxHighQualityPoolSize;
     
@@ -895,30 +891,92 @@ async function getBandwidthPoolIPs(env) {
       LIMIT ?
     `).bind(maxPoolSize).all();
     
-    const ips = result.results || [];
-    // 缓存结果
-    highQualityCache.set('bandwidth_pool', ips);
-    return ips;
+    return result.results || [];
   } catch (e) {
     await addSystemLog(env, `❌ getBandwidthPoolIPs 错误: ${e.message}`);
     return [];
   }
 }
 
-async function checkInBandwidthPool(env, ip) {
+async function checkInPool(env, ip, poolType = 'bandwidth') {
+  const tableName = poolType === 'bandwidth' ? 'high_quality_ips' : 'backup_quality_ips';
   try {
-    const result = await env.DB.prepare('SELECT ip FROM high_quality_ips WHERE ip = ?').bind(ip).first();
+    const result = await env.DB.prepare(`SELECT ip FROM ${tableName} WHERE ip = ?`).bind(ip).first();
     return !!result;
   } catch (e) { return false; }
+}
+
+// 兼容性别名
+async function checkInBandwidthPool(env, ip) {
+  return checkInPool(env, ip, 'bandwidth');
 }
 
 async function checkInBackupPool(env, ip) {
-  try {
-    const result = await env.DB.prepare('SELECT ip FROM backup_quality_ips WHERE ip = ?').bind(ip).first();
-    return !!result;
-  } catch (e) { return false; }
+  return checkInPool(env, ip, 'backup');
 }
 
+async function addToPool(env, ip, latency, bandwidth, geo, score, poolType = 'bandwidth') {
+  try {
+    const isBandwidthPool = poolType === 'bandwidth';
+    const tableName = isBandwidthPool ? 'high_quality_ips' : 'backup_quality_ips';
+    const maxPoolSize = isBandwidthPool ? (await getAdvancedConfig(env)).maxHighQualityPoolSize : 50;
+    const qualityType = isBandwidthPool ? 'bandwidth' : null;
+    
+    // 检查IP是否已存在
+    const existingIP = await env.DB.prepare(`SELECT ip FROM ${tableName} WHERE ip = ?`).bind(ip).first();
+    if (existingIP) {
+      const updateSql = isBandwidthPool 
+        ? `UPDATE ${tableName} SET latency = ?, bandwidth = ?, country = ?, city = ?, last_tested = CURRENT_TIMESTAMP, quality_type = ? WHERE ip = ?`
+        : `UPDATE ${tableName} SET latency = ?, bandwidth = ?, country = ?, city = ?, last_tested = CURRENT_TIMESTAMP WHERE ip = ?`;
+      
+      if (isBandwidthPool) {
+        await env.DB.prepare(updateSql).bind(latency, bandwidth || null, geo.country, geo.city, qualityType, ip).run();
+        await addSystemLog(env, `🔄 ${ip} 更新带宽池数据 (${latency}ms, ${bandwidth || 0}Mbps, 评分${score})`);
+      } else {
+        await env.DB.prepare(updateSql).bind(latency, bandwidth || null, geo.country, geo.city, ip).run();
+        await addSystemLog(env, `🔄 ${ip} 更新备用池数据 (${latency}ms, ${bandwidth || 0}Mbps, 评分${score})`);
+      }
+      return;
+    }
+    
+    // 检查池大小
+    const currentCount = await env.DB.prepare(`SELECT COUNT(*) as count FROM ${tableName}`).first();
+    const currentPoolSize = currentCount ? currentCount.count : 0;
+    
+    if (currentPoolSize >= maxPoolSize) {
+      const worstIP = await env.DB.prepare(`
+        SELECT ip, bandwidth FROM ${tableName} 
+        ORDER BY (CASE WHEN bandwidth IS NULL OR bandwidth = 0 THEN 0 ELSE bandwidth END) ASC 
+        LIMIT 1
+      `).first();
+      if (worstIP) {
+        await env.DB.prepare(`DELETE FROM ${tableName} WHERE ip = ?`).bind(worstIP.ip).run();
+        const poolName = isBandwidthPool ? '带宽池' : '备用池';
+        await addSystemLog(env, `🔄 替换${poolName}IP: ${worstIP.ip}(带宽${worstIP.bandwidth || 0}Mbps) → ${ip}(带宽${bandwidth || 0}Mbps)`);
+      }
+    }
+    
+    // 插入新IP
+    const insertSql = isBandwidthPool
+      ? `INSERT INTO ${tableName} (ip, latency, bandwidth, country, city, last_tested, quality_type) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)`
+      : `INSERT INTO ${tableName} (ip, latency, bandwidth, country, city, last_tested) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`;
+    
+    if (isBandwidthPool) {
+      await env.DB.prepare(insertSql).bind(ip, latency, bandwidth || null, geo.country, geo.city, qualityType).run();
+      const newCount = await env.DB.prepare(`SELECT COUNT(*) as count FROM ${tableName}`).first();
+      await addSystemLog(env, `✨ ${ip} (${geo.country}) - ${latency}ms, ${bandwidth || 0}Mbps, 评分${score} 已加入带宽池 (${newCount.count}/${maxPoolSize})`);
+    } else {
+      await env.DB.prepare(insertSql).bind(ip, latency, bandwidth || null, geo.country, geo.city).run();
+      const newCount = await env.DB.prepare(`SELECT COUNT(*) as count FROM ${tableName}`).first();
+      await addSystemLog(env, `📌 ${ip} (${geo.country}) - ${latency}ms, ${bandwidth || 0}Mbps, 评分${score} 已加入备用池 (${newCount.count}/${maxPoolSize})`);
+    }
+  } catch (e) {
+    const poolName = poolType === 'bandwidth' ? '带宽池' : '备用池';
+    await addSystemLog(env, `❌ 添加IP到${poolName}失败 ${ip}: ${e.message}`);
+  }
+}
+
+// 带宽池专用函数（带智能逻辑）
 async function addToBandwidthPool(env, ip, latency, bandwidth, geo, score) {
   try {
     const advancedConfig = await getAdvancedConfig(env);
@@ -934,8 +992,6 @@ async function addToBandwidthPool(env, ip, latency, bandwidth, geo, score) {
           WHERE ip = ?
         `).bind(latency, bandwidth || null, geo.country, geo.city, ip).run();
         await addSystemLog(env, `🔄 ${ip} 更新带宽池数据 (${latency}ms, ${bandwidth}Mbps, 评分${score})`);
-        // 清除缓存
-        highQualityCache.clear();
       } else {
         // 检查池大小，如果满了则替换带宽最低的IP
         const currentCount = await env.DB.prepare('SELECT COUNT(*) as count FROM high_quality_ips').first();
@@ -947,18 +1003,16 @@ async function addToBandwidthPool(env, ip, latency, bandwidth, geo, score) {
             LIMIT 1
           `).first();
           if (worstIP) {
-          await env.DB.prepare('DELETE FROM high_quality_ips WHERE ip = ?').bind(worstIP.ip).run();
-          await addSystemLog(env, `🔄 替换带宽池IP: ${worstIP.ip}(带宽${worstIP.bandwidth || 0}Mbps) → ${ip}(带宽${bandwidth}Mbps)`);
+            await env.DB.prepare('DELETE FROM high_quality_ips WHERE ip = ?').bind(worstIP.ip).run();
+            await addSystemLog(env, `🔄 替换带宽池IP: ${worstIP.ip}(带宽${worstIP.bandwidth || 0}Mbps) → ${ip}(带宽${bandwidth}Mbps)`);
+          }
         }
-      }
-      await env.DB.prepare(`
-        INSERT INTO high_quality_ips 
-        (ip, latency, bandwidth, country, city, last_tested, quality_type) 
-        VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 'bandwidth')
-      `).bind(ip, latency, bandwidth || null, geo.country, geo.city).run();
-      await addSystemLog(env, `✨ ${ip} (${geo.country}) - ${latency}ms, ${bandwidth}Mbps, 评分${score} 已加入带宽池 (优秀带宽直接加入)`);
-      // 清除缓存
-      highQualityCache.clear();
+        await env.DB.prepare(`
+          INSERT INTO high_quality_ips 
+          (ip, latency, bandwidth, country, city, last_tested, quality_type) 
+          VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 'bandwidth')
+        `).bind(ip, latency, bandwidth || null, geo.country, geo.city).run();
+        await addSystemLog(env, `✨ ${ip} (${geo.country}) - ${latency}ms, ${bandwidth}Mbps, 评分${score} 已加入带宽池 (优秀带宽直接加入)`);
       }
       return;
     }
@@ -973,8 +1027,6 @@ async function addToBandwidthPool(env, ip, latency, bandwidth, geo, score) {
           WHERE ip = ?
         `).bind(latency, bandwidth || null, geo.country, geo.city, ip).run();
         await addSystemLog(env, `🔄 ${ip} 更新带宽池数据 (${latency}ms, ${bandwidth || 0}Mbps, 评分${score})`);
-        // 清除缓存
-        highQualityCache.clear();
         return;
       }
       
@@ -1010,11 +1062,9 @@ async function addToBandwidthPool(env, ip, latency, bandwidth, geo, score) {
         `).bind(ip, latency, bandwidth || null, geo.country, geo.city).run();
         const newCount = await env.DB.prepare('SELECT COUNT(*) as count FROM high_quality_ips').first();
         await addSystemLog(env, `✨ ${ip} (${geo.country}) - ${latency}ms, ${bandwidth || 0}Mbps, 评分${score} 已加入带宽池 (${newCount.count}/${maxPoolSize})`);
-        // 清除缓存
-        highQualityCache.clear();
       } else {
         // 带宽优质池已满且当前IP带宽不高于池中所有IP，添加到备用池
-        await addToBackupPool(env, ip, latency, bandwidth, geo, score);
+        await addToPool(env, ip, latency, bandwidth, geo, score, 'backup');
       }
     } else {
       await addSystemLog(env, `⏭️ ${ip} - 带宽${bandwidth || 0}Mbps低于100Mbps，进入备用池`);
@@ -1024,48 +1074,9 @@ async function addToBandwidthPool(env, ip, latency, bandwidth, geo, score) {
   }
 }
 
+// 备用池专用函数（简化版，直接调用通用函数）
 async function addToBackupPool(env, ip, latency, bandwidth, geo, score) {
-  try {
-    const maxBackupPoolSize = 50;
-    
-    const existingIP = await env.DB.prepare('SELECT ip FROM backup_quality_ips WHERE ip = ?').bind(ip).first();
-    if (existingIP) {
-      await env.DB.prepare(`
-        UPDATE backup_quality_ips 
-        SET latency = ?, bandwidth = ?, country = ?, city = ?, last_tested = CURRENT_TIMESTAMP
-        WHERE ip = ?
-      `).bind(latency, bandwidth || null, geo.country, geo.city, ip).run();
-      await addSystemLog(env, `🔄 ${ip} 更新备用池数据 (${latency}ms, ${bandwidth || 0}Mbps, 评分${score})`);
-      return;
-    }
-    
-    const currentCount = await env.DB.prepare('SELECT COUNT(*) as count FROM backup_quality_ips').first();
-    let currentPoolSize = currentCount ? currentCount.count : 0;
-    
-    if (currentPoolSize >= maxBackupPoolSize) {
-      const worstIP = await env.DB.prepare(`
-        SELECT ip, bandwidth 
-        FROM backup_quality_ips 
-        ORDER BY (CASE WHEN bandwidth IS NULL OR bandwidth = 0 THEN 0 ELSE bandwidth END) ASC 
-        LIMIT 1
-      `).first();
-      if (worstIP) {
-        await env.DB.prepare('DELETE FROM backup_quality_ips WHERE ip = ?').bind(worstIP.ip).run();
-        await addSystemLog(env, `🔄 替换备用池IP: ${worstIP.ip}(带宽${worstIP.bandwidth || 0}Mbps) → ${ip}(带宽${bandwidth || 0}Mbps)`);
-      }
-    }
-    
-    await env.DB.prepare(`
-      INSERT INTO backup_quality_ips 
-      (ip, latency, bandwidth, country, city, last_tested) 
-      VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-    `).bind(ip, latency, bandwidth || null, geo.country, geo.city).run();
-    
-    const newCount = await env.DB.prepare('SELECT COUNT(*) as count FROM backup_quality_ips').first();
-    await addSystemLog(env, `📌 ${ip} (${geo.country}) - ${latency}ms, ${bandwidth || 0}Mbps, 评分${score} 已加入备用池 (${newCount.count}/${maxBackupPoolSize})`);
-  } catch (e) {
-    await addSystemLog(env, `❌ 添加IP到备用池失败 ${ip}: ${e.message}`);
-  }
+  return addToPool(env, ip, latency, bandwidth, geo, score, 'backup');
 }
 
 async function cleanLatencyPool(env) {
@@ -1242,7 +1253,7 @@ async function speedTestWithBandwidth(env, ip, geo = null, isRetest = false, ctx
   try {
     const cached = bandwidthCache.get(ip);
     if (cached) {
-      await addSystemLog(env, `${ip} - 使用缓存带宽数据`, 'info', 'speed_test');
+      await addSystemLog(env, `💾 ${ip} - 使用缓存带宽数据`);
       return cached;
     }
     
@@ -1276,7 +1287,7 @@ async function speedTestWithBandwidth(env, ip, geo = null, isRetest = false, ctx
     
     if (successCount === 0) {
       await addFailedIP(env, ip);
-      await addSystemLog(env, `${ip} - 延迟测试失败`, 'error', 'speed_test');
+      await addSystemLog(env, `❌ ${ip} - 延迟测试失败`);
       return { success: false, ip, latency: null, bandwidth: null };
     }
     
@@ -1285,6 +1296,10 @@ async function speedTestWithBandwidth(env, ip, geo = null, isRetest = false, ctx
     
     let bandwidthMbps = null;
     let downloadSpeed = null;
+    
+    // 确保 geo 和 countryName 已定义
+    if (!geo) geo = await getIPGeo(env, ip);
+    const countryName = COUNTRY_NAMES[geo.country] || geo.country || '未知';
     
     const shouldTest = await shouldPerformBandwidthTest(ip, isRetest, avgLatency);
     
@@ -1311,21 +1326,18 @@ async function speedTestWithBandwidth(env, ip, geo = null, isRetest = false, ctx
             country: geo.country, countryName
           });
         } else {
-          await addSystemLog(env, `${ip} - 带宽测试返回 ${response.status}`, 'warning', 'speed_test');
+          await addSystemLog(env, `⚠️ ${ip} - 带宽测试返回 ${response.status}`);
           bandwidthMbps = estimateBandwidthByLatency(avgLatency);
         }
       } catch (e) {
-        await addSystemLog(env, `${ip} - 带宽测试失败: ${e.message}`, 'warning', 'speed_test');
+        await addSystemLog(env, `⚠️ ${ip} - 带宽测试失败: ${e.message}`);
         bandwidthMbps = estimateBandwidthByLatency(avgLatency);
       }
     } else {
       bandwidthMbps = estimateBandwidthByLatency(avgLatency);
     }
     
-    if (!geo) geo = await getIPGeo(env, ip);
-    
     const bandwidthLevel = getBandwidthLevel(bandwidthMbps);
-    const countryName = COUNTRY_NAMES[geo.country] || geo.country || '未知';
     const score = calculateIPScore(avgLatency, bandwidthMbps || 0);
     
     const writePromise = (async () => {
@@ -1361,35 +1373,35 @@ async function speedTestWithBandwidth(env, ip, geo = null, isRetest = false, ctx
         if (inBackupPool) {
           await env.DB.prepare('DELETE FROM backup_quality_ips WHERE ip = ?').bind(ip).run();
           await addToBandwidthPool(env, ip, avgLatency, bandwidthMbps, geo, score);
-          await addSystemLog(env, `${ip} 带宽优秀，从备用池升级到带宽池`, 'info', 'pool_management');
+          await addSystemLog(env, `⬆️ ${ip} 带宽优秀，从备用池升级到带宽池`);
         } else if (inBandwidthPool) {
           await env.DB.prepare(`
             UPDATE high_quality_ips 
             SET latency = ?, bandwidth = ?, country = ?, city = ?, last_tested = CURRENT_TIMESTAMP, quality_type = 'bandwidth'
             WHERE ip = ?
           `).bind(avgLatency, bandwidthMbps || null, geo.country, geo.city, ip).run();
-          await addSystemLog(env, `${ip} 更新带宽池数据`, 'info', 'pool_management');
+          await addSystemLog(env, `🔄 ${ip} 更新带宽池数据`);
         }
       } else {
         if (inBandwidthPool) {
           await env.DB.prepare('DELETE FROM high_quality_ips WHERE ip = ?').bind(ip).run();
-          await addSystemLog(env, `${ip} 带宽不足(评分${score})，从带宽池移除`, 'info', 'pool_management');
+          await addSystemLog(env, `🗑️ ${ip} 带宽不足(评分${score})，从带宽池移除`);
         }
         if (inBackupPool) {
           await env.DB.prepare('DELETE FROM backup_quality_ips WHERE ip = ?').bind(ip).run();
-          await addSystemLog(env, `${ip} 带宽不足(评分${score})，从备用池移除`, 'info', 'pool_management');
+          await addSystemLog(env, `🗑️ ${ip} 带宽不足(评分${score})，从备用池移除`);
         }
       }
     } else if (!inBandwidthPool && !inBackupPool) {
       if (isHighQuality || isExcellentBandwidth) {
         await addToBandwidthPool(env, ip, avgLatency, bandwidthMbps, geo, score);
       } else {
-        await addSystemLog(env, `${ip} - 带宽不足(评分${score})，不加入任何池`, 'info', 'speed_test');
+        await addSystemLog(env, `📝 ${ip} - 带宽不足(评分${score})，不加入任何池`);
       }
     }
     
     const bandwidthInfo = bandwidthMbps ? ` | 带宽: ${bandwidthMbps} Mbps ${bandwidthLevel.star}` : ' | 带宽: 估算值';
-    await addSystemLog(env, `${ip} (${countryName}) - 延迟:${avgLatency}ms ${bandwidthInfo} | 评分:${score}`, 'info', 'speed_test');
+    await addSystemLog(env, `✅ ${ip} (${countryName}) - 延迟:${avgLatency}ms ${bandwidthInfo} | 评分:${score}`);
     
     return { 
       success: true, ip, latency: avgLatency, minLatency, maxLatency: Math.max(...latencyResults.filter(r => r !== null)),
@@ -1397,7 +1409,7 @@ async function speedTestWithBandwidth(env, ip, geo = null, isRetest = false, ctx
       score, country: geo.country, countryName
     };
   } catch (error) {
-    await addSystemLog(env, `${ip} - 测速异常: ${error.message}`, 'error', 'speed_test');
+    await addSystemLog(env, `❌ ${ip} - 测速异常: ${error.message}`);
     return { success: false, ip, error: error.message, latency: null, bandwidth: null };
   }
 }
@@ -1481,11 +1493,11 @@ async function smartSpeedTest(env, options = {}, ctx = null) {
     ipsToTest = ipsToTest.sort(() => 0.5 - Math.random());
     
     if (ipsToTest.length === 0) {
-      await addSystemLog(env, '没有需要测试的IP', 'info', 'speed_test');
+      await addSystemLog(env, 'ℹ️ 没有需要测试的IP');
       return { success: true, message: '无需测试' };
     }
     
-    await addSystemLog(env, `智能测速: 测试 ${ipsToTest.length} 个IP`, 'info', 'speed_test');
+    await addSystemLog(env, `📊 智能测速: 测试 ${ipsToTest.length} 个IP`);
     
     const batchSize = Math.min(maxConcurrent, 2);
     const existingSet = new Set(existingIPs);
@@ -1545,7 +1557,7 @@ async function smartSpeedTest(env, options = {}, ctx = null) {
     await updateRegionQuality(env);
     
     const newBandwidthCount = (await getBandwidthPoolIPs(env)).length;
-    await addSystemLog(env, `测速完成 | 成功: ${successCount}, 失败: ${failCount} | 带宽池: ${newBandwidthCount}/${maxPoolSize}`, 'info', 'speed_test');
+    await addSystemLog(env, `✅ 测速完成 | 成功: ${successCount}, 失败: ${failCount} | 带宽池: ${newBandwidthCount}/${maxPoolSize}`);
     await sendTelegramNotification(env, {
       message: {
         ipCount: successCount,
@@ -1561,69 +1573,75 @@ async function smartSpeedTest(env, options = {}, ctx = null) {
     
     // 检查是否需要在测速完成后自动更新DNS
     const dnsConfig = await env.KV.get(CONFIG.kvKeys.dnsConfig, 'json');
-    await addSystemLog(env, `检查自动更新DNS: autoUpdateAfterTest=${dnsConfig?.autoUpdateAfterTest}, DNS配置完整=${!!(dnsConfig?.apiToken && dnsConfig?.zoneId && dnsConfig?.recordName)}`, 'info', 'dns');
+    await addSystemLog(env, `🔍 检查自动更新DNS: autoUpdateAfterTest=${dnsConfig?.autoUpdateAfterTest}, DNS配置完整=${!!(dnsConfig?.apiToken && dnsConfig?.zoneId && dnsConfig?.recordName)}`);
     if (dnsConfig?.autoUpdateAfterTest) {
       const config = getEnvConfig(env);
       const uiConfig = await env.KV.get(CONFIG.kvKeys.uiConfig, 'json') || {};
       const ipCount = uiConfig.ipCount || config.defaultIpCount;
       // 先尝试获取中国IP，如果没有则获取全球IP
       let bestIPs = await getBestIPs(env, 'CN', ipCount);
-      await addSystemLog(env, `自动更新DNS: 找到 ${bestIPs.length} 个中国最佳IP`, 'info', 'dns');
+      await addSystemLog(env, `🔍 自动更新DNS: 找到 ${bestIPs.length} 个中国最佳IP`);
       if (bestIPs.length === 0) {
-        await addSystemLog(env, `没有找到中国IP，尝试获取全球最佳IP`, 'info', 'dns');
+        await addSystemLog(env, `🔍 没有找到中国IP，尝试获取全球最佳IP`);
         bestIPs = await getBestIPs(env, null, ipCount);
-        await addSystemLog(env, `自动更新DNS: 找到 ${bestIPs.length} 个全球最佳IP`, 'info', 'dns');
+        await addSystemLog(env, `🔍 自动更新DNS: 找到 ${bestIPs.length} 个全球最佳IP`);
       }
       if (bestIPs.length > 0) {
         await updateDNSBatch(env, bestIPs.map(item => item.ip), 'auto_after_test');
-        await addSystemLog(env, `测速完成后自动更新DNS: ${bestIPs.length} 个IP`, 'info', 'dns');
+        await addSystemLog(env, `🌍 测速完成后自动更新DNS: ${bestIPs.length} 个IP`);
       } else {
-        await addSystemLog(env, `自动更新DNS失败: 没有找到最佳IP`, 'warning', 'dns');
+        await addSystemLog(env, `⚠️ 自动更新DNS失败: 没有找到最佳IP`);
       }
     }
     
     return { success: true, successCount, failCount, bandwidthCount: newBandwidthCount };
   } catch (e) {
-    await addSystemLog(env, `测速失败: ${e.message}`, 'error', 'speed_test');
+    await addSystemLog(env, `❌ 测速失败: ${e.message}`);
     return { success: false, error: e.message };
   }
 }
 
-async function updateRegionQuality(env) {
+// 通用区域数据更新函数
+async function updateRegionData(env, type = 'quality') {
   try {
+    const isQuality = type === 'quality';
+    const tableName = isQuality ? 'region_quality' : 'region_stats';
+    
+    // 构建查询SQL
+    const selectFields = isQuality 
+      ? 'country, COUNT(*) as ip_count, AVG(latency) as avg_latency, AVG(bandwidth) as avg_bandwidth, MIN(latency) as min_latency, MAX(latency) as max_latency'
+      : 'country, COUNT(*) as ip_count, AVG(latency) as avg_latency, AVG(bandwidth) as avg_bandwidth';
+    
     const stats = await env.DB.prepare(`
-      SELECT country, COUNT(*) as ip_count, AVG(latency) as avg_latency, AVG(bandwidth) as avg_bandwidth,
-             MIN(latency) as min_latency, MAX(latency) as max_latency
+      SELECT ${selectFields}
       FROM high_quality_ips WHERE country != 'unknown' GROUP BY country
     `).all();
     
     const operations = [];
     for (const stat of stats.results || []) {
-      operations.push(env.DB.prepare(`
-        INSERT OR REPLACE INTO region_quality (country, ip_count, avg_latency, avg_bandwidth, min_latency, max_latency, last_updated)
-        VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-      `).bind(stat.country, stat.ip_count, Math.round(stat.avg_latency), stat.avg_bandwidth ? Math.round(stat.avg_bandwidth * 10) / 10 : null, stat.min_latency, stat.max_latency));
+      if (isQuality) {
+        operations.push(env.DB.prepare(`
+          INSERT OR REPLACE INTO ${tableName} (country, ip_count, avg_latency, avg_bandwidth, min_latency, max_latency, last_updated)
+          VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        `).bind(stat.country, stat.ip_count, Math.round(stat.avg_latency), stat.avg_bandwidth ? Math.round(stat.avg_bandwidth * 10) / 10 : null, stat.min_latency, stat.max_latency));
+      } else {
+        operations.push(env.DB.prepare(`
+          INSERT OR REPLACE INTO ${tableName} (country, ip_count, avg_latency, avg_bandwidth, last_updated)
+          VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+        `).bind(stat.country, stat.ip_count, Math.round(stat.avg_latency), stat.avg_bandwidth ? Math.round(stat.avg_bandwidth * 10) / 10 : null));
+      }
     }
     if (operations.length > 0) await env.DB.batch(operations);
   } catch (e) {}
 }
 
+// 兼容性别名
+async function updateRegionQuality(env) {
+  return updateRegionData(env, 'quality');
+}
+
 async function updateRegionStats(env) {
-  try {
-    const stats = await env.DB.prepare(`
-      SELECT country, COUNT(*) as ip_count, AVG(latency) as avg_latency, AVG(bandwidth) as avg_bandwidth
-      FROM high_quality_ips WHERE country != 'unknown' GROUP BY country
-    `).all();
-    
-    const operations = [];
-    for (const stat of stats.results || []) {
-      operations.push(env.DB.prepare(`
-        INSERT OR REPLACE INTO region_stats (country, ip_count, avg_latency, avg_bandwidth, last_updated)
-        VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-      `).bind(stat.country, stat.ip_count, Math.round(stat.avg_latency), stat.avg_bandwidth ? Math.round(stat.avg_bandwidth * 10) / 10 : null));
-    }
-    if (operations.length > 0) await env.DB.batch(operations);
-  } catch (e) {}
+  return updateRegionData(env, 'stats');
 }
 
 async function getSpeedStrategy(env) {
@@ -1716,17 +1734,9 @@ async function getTotalIPCount(env) {
 
 async function getAllIPs(env) {
   try {
-    // 尝试从缓存获取
-    const cached = highQualityCache.get('all_ips');
-    if (cached) return cached;
-    
     const ips = await env.KV.get(CONFIG.kvKeys.ipList, 'json') || [];
     const customIPs = await env.KV.get(CONFIG.kvKeys.customIPs, 'json') || [];
-    const result = [...new Set([...ips, ...customIPs])];
-    
-    // 缓存结果
-    highQualityCache.set('all_ips', result);
-    return result;
+    return [...new Set([...ips, ...customIPs])];
   } catch (e) { return []; }
 }
 
@@ -1769,8 +1779,6 @@ async function updateIPs(env) {
   const ipList = Array.from(allIPs).sort(compareIPs);
   await env.KV.put(CONFIG.kvKeys.ipList, JSON.stringify(ipList));
   await env.KV.put(CONFIG.kvKeys.lastUpdate, new Date().toLocaleString('zh-CN'));
-  // 清除缓存
-  highQualityCache.clear();
   await addSystemLog(env, `🔄 IP列表已更新: ${ipList.length} 个IP`);
   return ipList;
 }
@@ -2017,7 +2025,6 @@ async function updateDNSBatch(env, ips, triggerSource = 'manual') {
         hideIP: dnsConfig.telegramHideIP !== false,
         type: 'success'
       });
-      return { success: true, successCount };
     } else {
       const sourceText = getSourceText(triggerSource);
       await sendTelegramNotification(env, {
@@ -2028,8 +2035,8 @@ async function updateDNSBatch(env, ips, triggerSource = 'manual') {
         },
         type: 'error'
       });
-      return { success: false, error: '没有成功更新任何DNS记录' };
     }
+    return { success: successCount > 0, count: successCount };
   } catch (e) {
     await addSystemLog(env, `❌ DNS更新失败: ${e.message}`);
     return { success: false, error: e.message, count: 0 };
@@ -2109,87 +2116,59 @@ async function handleVisitorInfo(request, env) {
   }), { headers: { 'Content-Type': 'application/json' } });
 }
 
-async function handleRegionStats(env) {
+// 通用数据处理函数
+async function handleDataQuery(env, type) {
   try {
-    const stats = await env.DB.prepare(`SELECT country, ip_count, avg_latency, avg_bandwidth, last_updated FROM region_stats ORDER BY avg_latency ASC LIMIT 20`).all();
-    const topRegions = (stats.results || []).map(stat => ({
-      country: stat.country, countryName: COUNTRY_NAMES[stat.country] || stat.country,
-      ipCount: stat.ip_count, avgLatency: stat.avg_latency, avgBandwidth: stat.avg_bandwidth
-    }));
-    return { success: true, regions: topRegions };
+    switch (type) {
+      case 'region-stats': {
+        const stats = await env.DB.prepare(`SELECT country, ip_count, avg_latency, avg_bandwidth, last_updated FROM region_stats ORDER BY avg_latency ASC LIMIT 20`).all();
+        const topRegions = (stats.results || []).map(stat => ({
+          country: stat.country, countryName: COUNTRY_NAMES[stat.country] || stat.country,
+          ipCount: stat.ip_count, avgLatency: stat.avg_latency, avgBandwidth: stat.avg_bandwidth
+        }));
+        return { success: true, regions: topRegions };
+      }
+      
+      case 'region-quality': {
+        const quality = await env.DB.prepare(`SELECT country, ip_count, avg_latency, avg_bandwidth, min_latency, max_latency, last_updated FROM region_quality ORDER BY avg_latency ASC LIMIT 20`).all();
+        const stats = await env.DB.prepare(`SELECT COUNT(*) as total_regions, SUM(ip_count) as total_ips, AVG(avg_latency) as global_avg_latency, AVG(avg_bandwidth) as global_avg_bandwidth FROM region_quality`).first();
+        return {
+          success: true,
+          regions: (quality.results || []).map(r => ({
+            country: r.country, countryName: COUNTRY_NAMES[r.country] || r.country,
+            ipCount: r.ip_count, avgLatency: r.avg_latency, avgBandwidth: r.avg_bandwidth,
+            minLatency: r.min_latency, maxLatency: r.max_latency, lastUpdated: r.last_updated
+          })),
+          summary: stats
+        };
+      }
+      
+      case 'speed-strategy': {
+        const strategy = await getSpeedStrategy(env);
+        const now = new Date();
+        const asiaHour = (now.getHours() + 8) % 24;
+        return { success: true, strategy, asiaHour, nextRun: strategy.type === 'urgent' ? '立即' : '下次定时任务' };
+      }
+      
+      default:
+        return { success: false, error: 'Unknown query type' };
+    }
   } catch (e) {
     return { success: false, error: e.message };
   }
+}
+
+// 兼容性别名
+async function handleRegionStats(env) {
+  return handleDataQuery(env, 'region-stats');
 }
 
 async function handleRegionQuality(env) {
-  try {
-    const quality = await env.DB.prepare(`SELECT country, ip_count, avg_latency, avg_bandwidth, min_latency, max_latency, last_updated FROM region_quality ORDER BY avg_latency ASC LIMIT 20`).all();
-    const stats = await env.DB.prepare(`SELECT COUNT(*) as total_regions, SUM(ip_count) as total_ips, AVG(avg_latency) as global_avg_latency, AVG(avg_bandwidth) as global_avg_bandwidth FROM region_quality`).first();
-    return {
-      success: true,
-      regions: (quality.results || []).map(r => ({
-        country: r.country, countryName: COUNTRY_NAMES[r.country] || r.country,
-        ipCount: r.ip_count, avgLatency: r.avg_latency, avgBandwidth: r.avg_bandwidth,
-        minLatency: r.min_latency, maxLatency: r.max_latency, lastUpdated: r.last_updated
-      })),
-      summary: stats
-    };
-  } catch (e) {
-    return { success: false, error: e.message };
-  }
+  return handleDataQuery(env, 'region-quality');
 }
 
 async function handleSpeedStrategy(env) {
-  try {
-    const strategy = await getSpeedStrategy(env);
-    const now = new Date();
-    const asiaHour = (now.getHours() + 8) % 24;
-    return { success: true, strategy, asiaHour, nextRun: strategy.type === 'urgent' ? '立即' : '下次定时任务' };
-  } catch (e) {
-    return { success: false, error: e.message };
-  }
-}
-
-async function verifySession(sessionId, env) {
-  if (!sessionId) return false;
-  try {
-    const sessions = await env.KV.get(CONFIG.kvKeys.sessions, 'json');
-    return sessions && sessions[sessionId];
-  } catch { return false; }
-}
-
-async function handleLogin(request, env) {
-  try {
-    const { password } = await request.json();
-    const config = getEnvConfig(env);
-    if (!config.adminPassword) {
-      return new Response(JSON.stringify({ success: false, error: '管理员密码未配置' }), { status: 500, headers: { 'Content-Type': 'application/json' } });
-    }
-    if (password === config.adminPassword) {
-      const sessionId = generateSessionId();
-      const sessions = await env.KV.get(CONFIG.kvKeys.sessions, 'json') || {};
-      sessions[sessionId] = { createdAt: Date.now() };
-      await env.KV.put(CONFIG.kvKeys.sessions, JSON.stringify(sessions));
-      await addSystemLog(env, '🔐 管理员登录成功');
-      return new Response(JSON.stringify({ success: true, sessionId }), { headers: { 'Content-Type': 'application/json' } });
-    } else {
-      return new Response(JSON.stringify({ success: false, error: '密码错误' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
-    }
-  } catch (error) {
-    return new Response(JSON.stringify({ success: false, error: error.message }), { status: 500, headers: { 'Content-Type': 'application/json' } });
-  }
-}
-
-async function handleLogout(request, env) {
-  const sessionId = getSessionId(request);
-  if (sessionId) {
-    const sessions = await env.KV.get(CONFIG.kvKeys.sessions, 'json') || {};
-    delete sessions[sessionId];
-    await env.KV.put(CONFIG.kvKeys.sessions, JSON.stringify(sessions));
-    await addSystemLog(env, '🔓 管理员登出');
-  }
-  return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
+  return handleDataQuery(env, 'speed-strategy');
 }
 
 async function handleDBStatus(env) {
@@ -2223,15 +2202,6 @@ async function handleCleanPool(env) {
   highQualityCache.clear();
   await addSystemLog(env, `🧹 手动清理带宽池完成，带宽池：0，备用池：0`);
   return { success: true, bandwidthCount: 0, backupCount: 0 };
-}
-
-async function getQualityMode(env) {
-  const strategy = await env.DB.prepare('SELECT quality_mode FROM speed_strategy WHERE id = 1').first();
-  if (!strategy) {
-    await env.DB.prepare(`INSERT INTO speed_strategy (id, quality_mode) VALUES (1, 'bandwidth')`).run();
-    return 'bandwidth';
-  }
-  return strategy.quality_mode || 'bandwidth';
 }
 
 async function checkBandwidthReliability(env) {
@@ -2936,38 +2906,8 @@ async function getMainHTML(env) {
       </div>
       
       <div class="card">
-        <div class="card-header">
-          <div style="display: flex; justify-content: space-between; align-items: center; width: 100%;">
-            <h2>📝 运行日志</h2>
-            <div style="display: flex; gap: 8px; align-items: center;">
-              <button class="btn btn-sm btn-primary" onclick="refreshLogs()">刷新</button>
-              <button class="btn btn-sm btn-success" onclick="exportLogs()">导出</button>
-              <button class="btn btn-sm btn-danger" onclick="clearLogs()">清除</button>
-            </div>
-          </div>
-          <div style="display: flex; gap: 12px; flex-wrap: wrap; align-items: center; margin-top: 12px; justify-content: space-between;">
-            <div style="display: flex; gap: 12px; align-items: center; flex: 1;">
-              <select id="logLevelFilter" style="background: #0f172a; border: 1px solid #334155; border-radius: 8px; padding: 4px 8px; color: #e2e8f0; font-size: 12px; flex: 1; min-width: 100px;">
-                <option value="">所有级别</option>
-                <option value="info">信息</option>
-                <option value="warning">警告</option>
-                <option value="error">错误</option>
-              </select>
-              <select id="logCategoryFilter" style="background: #0f172a; border: 1px solid #334155; border-radius: 8px; padding: 4px 8px; color: #e2e8f0; font-size: 12px; flex: 1; min-width: 120px;">
-                <option value="">所有分类</option>
-                <option value="system">系统</option>
-                <option value="speed_test">测速</option>
-                <option value="pool_management">池管理</option>
-                <option value="dns">DNS</option>
-                <option value="telegram">Telegram</option>
-              </select>
-            </div>
-            <input type="text" id="logKeyword" placeholder="搜索关键词" style="background: #0f172a; border: 1px solid #334155; border-radius: 8px; padding: 4px 8px; color: #e2e8f0; font-size: 12px; flex: 1.5; min-width: 150px;">
-          </div>
-        </div>
-        <div class="card-body">
-          <div class="log-panel" id="logPanel"></div>
-        </div>
+        <div class="card-header"><h2>📝 运行日志</h2><div style="display: flex; gap: 8px;"><button class="btn btn-sm btn-danger" onclick="clearLogs()">清除</button><button class="btn btn-sm btn-primary" onclick="refreshLogs()">刷新</button></div></div>
+        <div class="card-body"><div class="log-panel" id="logPanel"></div></div>
       </div>
     </div>
   </div>
@@ -3387,103 +3327,22 @@ async function getMainHTML(env) {
   
   async function loadLogs() {
     try {
-      const level = document.getElementById('logLevelFilter').value;
-      const category = document.getElementById('logCategoryFilter').value;
-      const keyword = document.getElementById('logKeyword').value;
-      
-      const params = new URLSearchParams();
-      if (level) params.append('level', level);
-      if (category) params.append('category', category);
-      if (keyword) params.append('keyword', keyword);
-      
-      const url = '/api/get-logs?' + params.toString();
-      const res = await fetch(url);
-      if (!res.ok) {
-        throw new Error('API请求失败: ' + res.status);
-      }
+      const res = await fetch('/api/get-logs');
       const data = await res.json();
       const panel = document.getElementById('logPanel');
-      
-      if (data.logs?.length) {
-        panel.innerHTML = data.logs.map(l => {
-          let levelClass = '';
-          switch(l.level) {
-            case 'error': levelClass = 'color: #f87171;'; break;
-            case 'warning': levelClass = 'color: #fbbf24;'; break;
-            case 'info': levelClass = 'color: #60a5fa;'; break;
-          }
-          return '<div class="log-entry"> ' +
-            '<span class="log-time">[' + l.timeStr + ']</span> ' +
-            '<span style="' + levelClass + ' margin-right: 8px; font-size: 10px;">[' + l.level + ']</span>' +
-            '<span style="color: #94a3b8; margin-right: 8px; font-size: 10px;">[' + l.category + ']</span>' +
-            escapeHtml(l.message) +
-            '</div>';
-        }).join('');
-      } else {
-        panel.innerHTML = '<div class="log-entry">暂无日志</div>';
-      }
-    } catch(e) {
-      console.error('加载日志失败:', e);
-      showToast('加载日志失败: ' + e.message, 'error');
-    }
+      if (data.logs?.length) panel.innerHTML = data.logs.map(l => '<div class="log-entry"><span class="log-time">[' + l.timeStr + ']</span> ' + escapeHtml(l.message) + '</div>').join('');
+      else panel.innerHTML = '<div class="log-entry">暂无日志</div>';
+    } catch(e) {}
   }
   
   async function clearLogs() {
     showConfirm('清除所有日志？', async () => {
-      try {
-        const res = await fetch('/api/clear-logs', { method: 'POST' });
-        if (!res.ok) {
-          throw new Error('API请求失败: ' + res.status);
-        }
-        await loadLogs();
-        showToast('日志清除成功', 'success');
-      } catch(e) {
-        console.error('清除日志失败:', e);
-        showToast('清除日志失败: ' + e.message, 'error');
-      }
+      await fetch('/api/clear-logs', { method: 'POST' });
+      await loadLogs();
     });
   }
   
-  async function refreshLogs() { 
-    try {
-      await loadLogs();
-    } catch(e) {
-      console.error('刷新日志失败:', e);
-    }
-  }
-  
-  async function exportLogs() {
-    try {
-      const level = document.getElementById('logLevelFilter').value;
-      const category = document.getElementById('logCategoryFilter').value;
-      const keyword = document.getElementById('logKeyword').value;
-      
-      const params = new URLSearchParams();
-      if (level) params.append('level', level);
-      if (category) params.append('category', category);
-      if (keyword) params.append('keyword', keyword);
-      
-      const url = '/api/export-logs?' + params.toString();
-      const res = await fetch(url);
-      if (res.ok) {
-        const blob = await res.blob();
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = 'CF_Logs_' + new Date().toISOString().split('T')[0] + '.csv';
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        URL.revokeObjectURL(url);
-        showToast('日志导出成功', 'success');
-      } else {
-        throw new Error('API请求失败: ' + res.status);
-      }
-    } catch(e) {
-      console.error('导出日志失败:', e);
-      showToast('导出失败: ' + e.message, 'error');
-    }
-  }
+  async function refreshLogs() { await loadLogs(); }
   
   async function checkDBStatus() {
     try {
@@ -4636,7 +4495,7 @@ function getSettingsHTML(env) {
   }
   
   window.countryNames = ${JSON.stringify(COUNTRY_NAMES)};
-
+  window.onload = async () => { await loadDataSources(); await loadConfig(); await loadCustomIPs(); await loadLogConfig(); };
 </script>
 </body>
 </html>`;
@@ -4648,14 +4507,10 @@ export default {
     const path = url.pathname;
     const config = getEnvConfig(env);
 
-    // 同步初始化数据库，确保表结构存在
-    try {
+    ctx.waitUntil((async () => {
       await initDatabase(env);
       await runD1Migrations(env);
-    } catch (e) {
-      console.error('数据库初始化失败:', e);
-    }
-
+    })().catch(() => {}));
     ctx.waitUntil(cleanExpiredFailedIPs(env).catch(() => {}));
     ctx.waitUntil(cleanExpiredGeoCache(env).catch(() => {}));
     ctx.waitUntil(cleanExpiredLogs(env).catch(() => {}));
@@ -4796,41 +4651,13 @@ export default {
       return new Response(JSON.stringify(result), { headers: { 'Content-Type': 'application/json' } });
     }
     if (path === '/api/get-logs') {
-      const { startDate, endDate, keyword, level, category, limit } = url.searchParams;
-      const logs = await getSystemLogs(env, {
-        startDate: startDate || undefined,
-        endDate: endDate || undefined,
-        keyword: keyword || undefined,
-        level: level || undefined,
-        category: category || undefined,
-        limit: limit ? parseInt(limit) : 100
-      });
+      const logs = await getSystemLogs(env);
       return new Response(JSON.stringify({ logs }), { headers: { 'Content-Type': 'application/json' } });
     }
     if (path === '/api/clear-logs' && request.method === 'POST') {
       await env.DB.exec('DELETE FROM system_logs');
-      await addSystemLog(env, '日志已被手动清除', 'info', 'system');
+      await addSystemLog(env, '📋 日志已被手动清除');
       return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
-    }
-    if (path === '/api/export-logs') {
-      const { startDate, endDate, keyword, level, category } = url.searchParams;
-      const csvContent = await exportLogs(env, {
-        startDate: startDate || undefined,
-        endDate: endDate || undefined,
-        keyword: keyword || undefined,
-        level: level || undefined,
-        category: category || undefined
-      });
-      if (csvContent) {
-        return new Response(csvContent, {
-          headers: {
-            'Content-Type': 'text/csv;charset=utf-8',
-            'Content-Disposition': 'attachment; filename="CF_Logs_' + new Date().toISOString().split('T')[0] + '.csv"'
-          }
-        });
-      } else {
-        return new Response(JSON.stringify({ success: false, error: '导出失败' }), { status: 500, headers: { 'Content-Type': 'application/json' } });
-      }
     }
     if (path === '/api/smart-speedtest' && request.method === 'POST') {
       await addSystemLog(env, '🔧 手动触发智能测速');
@@ -5133,11 +4960,6 @@ export default {
       await flushLogs(env);
       await updateRegionQuality(env);
       
-      // 更新IP列表
-      await addSystemLog(env, `🔄 开始更新IP列表`);
-      await updateIPs(env);
-      await addSystemLog(env, `✅ IP列表更新完成`);
-      
       const strategy = await getSpeedStrategy(env);
       let targetCountry = null;
       let logMessage = '';
@@ -5167,26 +4989,13 @@ export default {
       await updateRegionQuality(env);
       
       const dnsConfig = await env.KV.get(CONFIG.kvKeys.dnsConfig, 'json');
-      await addSystemLog(env, `🔍 检查自动更新DNS: autoUpdate=${dnsConfig?.autoUpdate}, DNS配置完整=${!!(dnsConfig?.apiToken && dnsConfig?.zoneId && dnsConfig?.recordName)}`);
       if (dnsConfig?.autoUpdate) {
-        if (!dnsConfig.apiToken || !dnsConfig.zoneId || !dnsConfig.recordName) {
-          await addSystemLog(env, `⚠️ 自动更新DNS失败: DNS配置不完整`);
-        } else {
-          const config = getEnvConfig(env);
-          const uiConfig = await env.KV.get(CONFIG.kvKeys.uiConfig, 'json') || {};
-          const ipCount = uiConfig.ipCount || config.defaultIpCount;
-          const bestIPs = await getBestIPs(env, 'CN', ipCount);
-          await addSystemLog(env, `🔍 自动更新DNS: 找到 ${bestIPs.length} 个最佳IP`);
-          if (bestIPs.length > 0) {
-            const result = await updateDNSBatch(env, bestIPs.map(item => item.ip), 'cron');
-            if (result.success) {
-              await addSystemLog(env, `✅ 定时任务自动更新DNS成功: ${result.successCount || bestIPs.length} 个IP`);
-            } else {
-              await addSystemLog(env, `❌ 定时任务自动更新DNS失败: ${result.error || '未知错误'}`);
-            }
-          } else {
-            await addSystemLog(env, `⚠️ 自动更新DNS失败: 没有找到最佳IP`);
-          }
+        const config = getEnvConfig(env);
+        const uiConfig = await env.KV.get(CONFIG.kvKeys.uiConfig, 'json') || {};
+        const ipCount = uiConfig.ipCount || config.defaultIpCount;
+        const bestIPs = await getBestIPs(env, 'CN', ipCount);
+        if (bestIPs.length > 0) {
+          await updateDNSBatch(env, bestIPs.map(item => item.ip), 'cron');
         }
       }
       
@@ -5203,4 +5012,3 @@ export default {
     }
   }
 };
-
