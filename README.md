@@ -31,6 +31,13 @@
 - 🔍 **智能搜索** - IP 快速筛选定位
 - 🌙 **深色主题** - 护眼配色方案
 
+
+### 登录界面
+![登录界面截图](https://raw.githubusercontent.com/ldg118/CF-Worker-BestIP/refs/heads/main/docs/images/1.png)
+### 操作界面
+![操作界面截图1](https://raw.githubusercontent.com/ldg118/CF-Worker-BestIP/refs/heads/main/docs/images/2.png)
+![操作界面截图2](https://raw.githubusercontent.com/ldg118/CF-Worker-BestIP/refs/heads/main/docs/images/3.png)
+
 ## 快速开始
 
 ### 方式一：一键部署到 Cloudflare Workers（推荐）
@@ -81,6 +88,19 @@ ADMIN_PASSWORD = your_secure_password
 ```
 0 * * * *    # 每小时执行一次
 ```
+
+> **⚠️ 子请求限制说明**：
+> Cloudflare Workers 免费版每个请求最多 50 个子请求。定时任务包含测速和 DNS 更新两个阶段：
+> - **测速阶段**：20 个 IP × 2 个子请求（延迟+带宽）≈ 40 个子请求
+> - **DNS 更新阶段**：1（查询）+ N（删除旧记录）+ N（创建新记录）个子请求
+>   - 例如：配置 5 个 IP → 1 + 5 + 5 = 11 个子请求
+>   - 多国家模式 3 个国家 × 11 = 33 个子请求
+> - **总计**：40 + 33 = 73 个子请求 > 50 限制 ❌
+>
+> **解决方案**：
+> 1. 减少 DNS 更新的 IP 数量（建议最多 3 个）
+> 2. 减少多国家模式的国家数量
+> 3. 代码已优化：DNS 更新改为串行执行，限制最多 3 个 IP
 
 ***
 
@@ -275,12 +295,13 @@ cf-best-ip/
 | ------------------------- | ---------- | --------------- | ------------ | -------- |
 | `worker.js`               | ✅ 直接使用     | ✅ 直接使用          | ⚠️ 可选（优先使用 _worker.js） | 主程序文件    |
 | `_worker.js`              | ❌ 不使用      | ❌ 不使用           | ✅ 直接使用          | 主程序文件（Pages 专用） |
+| `functions/[[path]].js`   | ❌ 不使用      | ✅ 推荐使用          | ✅ 推荐使用          | Pages Functions 入口（推荐） |
 | `wrangler.toml`           | ✅ 必需       | ⚠️ 可选            | ⚠️ 可选         | 配置文件     |
 | `migrations/001_init.sql` | ✅ 必需       | ✅ 必需            | ✅ 必需         | 数据库初始化脚本 |
 
 > **注意**：
-> - **Pages 自动部署（Git）**：直接使用 `worker.js`，无需重命名
-> - **Pages 直接上传**：使用 `_worker.js`，这是 Cloudflare Pages 的命名规范
+> - **Pages 自动部署（Git）**：推荐使用 `functions/[[path]].js`，这是 Pages 的现代推荐方式
+> - **Pages 直接上传**：可以使用 `_worker.js` 或 `functions/[[path]].js`
 > - **Workers 部署**：直接使用 `worker.js`，无需重命名
 
 ### 部署方式对比
@@ -288,8 +309,8 @@ cf-best-ip/
 | 方式                  | 文件要求         | 定时任务  | 推荐度     |
 | ------------------- | ------------ | ----- | ------- |
 | **方式一 Workers**     | `worker.js`  | ✅ 支持  | ⭐⭐⭐ 最推荐 |
-| **方式二 A Pages 自动部署（Git）** | `worker.js`  | ❌ 不支持 | ⭐⭐ 推荐   |
-| **方式二 B Pages 直接上传**  | `_worker.js` | ❌ 不支持 | ⭐⭐ 推荐   |
+| **方式二 A Pages 自动部署（Git）** | `functions/[[path]].js`  | ❌ 不支持 | ⭐⭐ 推荐   |
+| **方式二 B Pages 直接上传**  | `_worker.js` 或 `functions/[[path]].js` | ❌ 不支持 | ⭐⭐ 推荐   |
 
 ***
 

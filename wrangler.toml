@@ -68,7 +68,13 @@ DEFAULT_IP_COUNT = "3"
 DEFAULT_TEST_COUNT = "10"
 DEFAULT_THREAD_COUNT = "5"
 
-# ==================== Pages 配置 (可选) ====================
-# 如需同时部署到 Pages，取消下面注释
-# [site]
-# bucket = "./public"
+# ==================== Pages 配置 ====================
+# Pages Functions 配置 - 使用 functions 目录
+# 支持两种方式：
+# 1. 根目录 _worker.js（单文件）
+# 2. functions/[[path]].js（多路由，推荐）
+[site]
+bucket = "./public"
+
+# Pages Functions 目录设置
+# 默认使用 functions 目录，无需额外配置
