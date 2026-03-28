@@ -107,3 +107,17 @@ dist
 .yarn/build-state.yml
 .yarn/install-state.gz
 .pnp.*
+
+# Wrangler
+.wrangler/
+.dev.vars
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project specific (not needed for deployment)
+历史版本/
+测试文件/
+docs/
+DEPLOY.md
