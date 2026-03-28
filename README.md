@@ -33,11 +33,10 @@
 
 
 ### 登录界面
-https://github.com/ldg118/CF-Worker-BestIP/blob/main/docs/images/1.png
-
+![登录界面截图](https://raw.githubusercontent.com/ldg118/CF-Worker-BestIP/refs/heads/main/docs/images/1.png)
 ### 操作界面
-https://github.com/ldg118/CF-Worker-BestIP/blob/main/docs/images/2.png
-https://github.com/ldg118/CF-Worker-BestIP/blob/main/docs/images/3.png
+![操作界面截图1](https://raw.githubusercontent.com/ldg118/CF-Worker-BestIP/refs/heads/main/docs/images/2.png)
+![操作界面截图2](https://raw.githubusercontent.com/ldg118/CF-Worker-BestIP/refs/heads/main/docs/images/3.png)
 
 ## 快速开始
 
