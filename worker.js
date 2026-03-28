@@ -1,8 +1,8 @@
 // Cloudflare Worker 优选IP可视化面板 - 双池智能优化版
-// 版本: v4.5.0 - 优化界面显示，修复语法错误
+// 版本: v4.6.2 
 // 项目地址: https://github.com/ldg118/CF-Worker-BestIP
 
-const VERSION = 'v4.5.0';
+const VERSION = 'v4.6.2';
 const GITHUB_URL = 'https://github.com/ldg118/CF-Worker-BestIP';
 
 const CONFIG = {
@@ -124,15 +124,6 @@ CREATE TABLE IF NOT EXISTS region_quality (
   min_latency INTEGER DEFAULT 0,
   max_latency INTEGER DEFAULT 0,
   last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS speed_strategy (
-  id INTEGER PRIMARY KEY CHECK (id = 1),
-  last_region TEXT DEFAULT 'CN',
-  last_maintain_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  global_maintain_count INTEGER DEFAULT 0,
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  quality_mode TEXT DEFAULT 'bandwidth'
 );
 
 CREATE INDEX IF NOT EXISTS idx_high_quality_latency ON high_quality_ips(latency);
@@ -271,6 +262,16 @@ function compareIPs(a, b) {
   return 0;
 }
 
+// 辅助函数：随机打乱数组
+function shuffleArray(array) {
+  const newArray = [...array];
+  for (let i = newArray.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [newArray[i], newArray[j]] = [newArray[j], newArray[i]];
+  }
+  return newArray;
+}
+
 // IP工具命名空间
 const IPUtils = {
   isValid: isValidIPv4,
@@ -293,9 +294,9 @@ function getSourceText(source) {
   const sourceMap = {
     'manual': '手动操作',
     'auto_after_test': '测速后自动更新',
-    'visitor_aware': '访客感知更新',
+    'visitor_aware': '访客感知',
     'cron': '定时任务',
-    'auto_after_local_test': '本地测试后自动更新'
+    'auto_after_local_test': '本地测试'
   };
   return sourceMap[source] || source;
 }
@@ -494,7 +495,7 @@ async function sendTelegramNotification(env, { message, hideIP = true, type = 'i
                        type === 'warning' ? '系统提醒' : 
                        type === 'error' ? '错误通知' : '系统通知'}</b>
 
-<b>📅 时间：</b><code>${new Date().toLocaleString('zh-CN')}</code>
+<b>📅 时间：</b><code>${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false })}</code>
 <b>📍 IP数量：</b><code>${message.ipCount || 0}个</code>
 <b>🎯 来源：</b><code>${message.source || '系统'}</code>
 <b>🔗 域名：</b><code>${message.domain || '未配置'}</code>
@@ -658,16 +659,6 @@ async function initDatabase(env) {
   } catch (e) { return false; }
 }
 
-async function runD1Migrations(env) {
-  const steps = [
-    `ALTER TABLE speed_strategy ADD COLUMN quality_mode TEXT DEFAULT 'bandwidth'`,
-    `ALTER TABLE high_quality_ips ADD COLUMN quality_type TEXT DEFAULT 'bandwidth'`,
-  ];
-  for (const sql of steps) {
-    try { await env.DB.prepare(sql).run(); } catch (_) {}
-  }
-}
-
 // 通用配置获取函数
 async function getConfig(env, type) {
   switch (type) {
@@ -676,7 +667,8 @@ async function getConfig(env, type) {
       const envConfig = getEnvConfig(env);
       return {
         maxHighQualityPoolSize: savedConfig.maxHighQualityPoolSize || envConfig.maxHighQualityPoolSize,
-        failedIpCooldownDays: savedConfig.failedIpCooldownDays || envConfig.failedIpCooldownDays
+        failedIpCooldownDays: savedConfig.failedIpCooldownDays || envConfig.failedIpCooldownDays,
+        maxBackupPoolSize: savedConfig.maxBackupPoolSize || 50
       };
     }
     
@@ -686,15 +678,6 @@ async function getConfig(env, type) {
         autoClean: savedConfig.autoClean !== false,
         cleanDays: Math.min(7, Math.max(3, parseInt(savedConfig.cleanDays) || 7))
       };
-    }
-    
-    case 'quality': {
-      const strategy = await env.DB.prepare('SELECT quality_mode FROM speed_strategy WHERE id = 1').first();
-      if (!strategy) {
-        await env.DB.prepare(`INSERT INTO speed_strategy (id, quality_mode) VALUES (1, 'bandwidth')`).run();
-        return 'bandwidth';
-      }
-      return strategy.quality_mode || 'bandwidth';
     }
     
     default:
@@ -709,10 +692,6 @@ async function getAdvancedConfig(env) {
 
 async function getLogConfig(env) {
   return getConfig(env, 'log');
-}
-
-async function getQualityMode(env) {
-  return getConfig(env, 'quality');
 }
 
 function getEnvConfig(env) {
@@ -740,15 +719,15 @@ async function getIPGeo(env, ip) {
     }
   } catch (e) {}
   
-  // 优先使用 ipapi.co（免费、准确）
+  // 首选: ipwho.is（免费，无需 API key）
   try {
-    const resp = await fetch(`https://ipapi.co/${ip}/json/`, { signal: AbortSignal.timeout(3000) });
+    const resp = await fetch(`https://ipwho.is/${ip}`, { signal: AbortSignal.timeout(2000) });
     if (resp.ok) {
       const data = await resp.json();
       if (data && data.country_code) {
         const geo = { 
           country: data.country_code, 
-          countryName: data.country_name || data.country || '', 
+          countryName: COUNTRY_NAMES[data.country_code] || data.country || '', 
           city: data.city || '' 
         };
         env.DB.prepare('INSERT OR REPLACE INTO ip_geo_cache (ip, country, country_name, city, cached_at) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)')
@@ -759,30 +738,15 @@ async function getIPGeo(env, ip) {
     }
   } catch (e) {}
   
-  // 备用 1: ip-api.com
+  // 备用: ip-api.com
   try {
-    const resp = await fetch(`http://ip-api.com/json/${ip}?fields=status,country,countryCode,city`, { signal: AbortSignal.timeout(3000) });
+    const resp = await fetch(`http://ip-api.com/json/${ip}?fields=status,country,countryCode,city`, { signal: AbortSignal.timeout(2000) });
     if (resp.ok) {
       const data = await resp.json();
       if (data.status === 'success' && data.countryCode) {
-        const geo = { country: data.countryCode, countryName: data.country, city: data.city || '' };
-        env.DB.prepare('INSERT OR REPLACE INTO ip_geo_cache (ip, country, country_name, city, cached_at) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)')
-          .bind(ip, geo.country, geo.countryName, geo.city).run().catch(() => {});
-        geoCache.set(ip, geo);
-        return geo;
-      }
-    }
-  } catch (e) {}
-  
-  // 备用 2: ipwho.is（免费，无需 API key）
-  try {
-    const resp = await fetch(`https://ipwho.is/${ip}`, { signal: AbortSignal.timeout(3000) });
-    if (resp.ok) {
-      const data = await resp.json();
-      if (data && data.country_code) {
         const geo = { 
-          country: data.country_code, 
-          countryName: data.country || '', 
+          country: data.countryCode, 
+          countryName: COUNTRY_NAMES[data.countryCode] || data.country || '', 
           city: data.city || '' 
         };
         env.DB.prepare('INSERT OR REPLACE INTO ip_geo_cache (ip, country, country_name, city, cached_at) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)')
@@ -883,14 +847,14 @@ async function getBandwidthPoolIPs(env) {
   try {
     const advancedConfig = await getAdvancedConfig(env);
     const maxPoolSize = advancedConfig.maxHighQualityPoolSize;
-    
+
     const result = await env.DB.prepare(`
-      SELECT ip, latency, bandwidth, country 
-      FROM high_quality_ips 
+      SELECT ip, latency, bandwidth, country, city, last_tested
+      FROM high_quality_ips
       ORDER BY (CASE WHEN bandwidth IS NULL OR bandwidth = 0 THEN 0 ELSE bandwidth END) DESC, latency ASC
       LIMIT ?
     `).bind(maxPoolSize).all();
-    
+
     return result.results || [];
   } catch (e) {
     await addSystemLog(env, `❌ getBandwidthPoolIPs 错误: ${e.message}`);
@@ -916,10 +880,15 @@ async function checkInBackupPool(env, ip) {
 }
 
 async function addToPool(env, ip, latency, bandwidth, geo, score, poolType = 'bandwidth') {
+  // 如果是备用池，调用专用的addToBackupPool函数
+  if (poolType === 'backup') {
+    return addToBackupPool(env, ip, latency, bandwidth, geo, score);
+  }
+  
   try {
     const isBandwidthPool = poolType === 'bandwidth';
     const tableName = isBandwidthPool ? 'high_quality_ips' : 'backup_quality_ips';
-    const maxPoolSize = isBandwidthPool ? (await getAdvancedConfig(env)).maxHighQualityPoolSize : 50;
+    const maxPoolSize = isBandwidthPool ? (await getAdvancedConfig(env)).maxHighQualityPoolSize : 20;
     const qualityType = isBandwidthPool ? 'bandwidth' : null;
     
     // 检查IP是否已存在
@@ -1074,30 +1043,71 @@ async function addToBandwidthPool(env, ip, latency, bandwidth, geo, score) {
   }
 }
 
-// 备用池专用函数（简化版，直接调用通用函数）
+// 备用池专用函数（带宽≥100Mbps，最大容量可配置）
 async function addToBackupPool(env, ip, latency, bandwidth, geo, score) {
-  return addToPool(env, ip, latency, bandwidth, geo, score, 'backup');
+  // 只存储带宽≥100Mbps的优质IP
+  if ((bandwidth || 0) < 100) {
+    await addSystemLog(env, `⏭️ ${ip} - 带宽${bandwidth || 0}Mbps低于100Mbps，不加入备用池`);
+    return { success: false, reason: 'bandwidth_too_low' };
+  }
+  
+  const advancedConfig = await getAdvancedConfig(env);
+  const maxBackupPoolSize = advancedConfig.maxBackupPoolSize || 50;
+  
+  try {
+    // 检查IP是否已存在
+    const existingIP = await env.DB.prepare('SELECT ip FROM backup_quality_ips WHERE ip = ?').bind(ip).first();
+    if (existingIP) {
+      await env.DB.prepare(`
+        UPDATE backup_quality_ips 
+        SET latency = ?, bandwidth = ?, country = ?, city = ?, last_tested = CURRENT_TIMESTAMP
+        WHERE ip = ?
+      `).bind(latency, bandwidth || null, geo.country, geo.city, ip).run();
+      await addSystemLog(env, `🔄 ${ip} 更新备用池数据 (${latency}ms, ${bandwidth || 0}Mbps, 评分${score})`);
+      return { success: true, action: 'updated' };
+    }
+    
+    // 检查池大小
+    const currentCount = await env.DB.prepare('SELECT COUNT(*) as count FROM backup_quality_ips').first();
+    const currentPoolSize = currentCount ? currentCount.count : 0;
+    
+    if (currentPoolSize >= maxBackupPoolSize) {
+      // 找到带宽最低的IP进行替换
+      const worstIP = await env.DB.prepare(`
+        SELECT ip, bandwidth FROM backup_quality_ips 
+        ORDER BY (CASE WHEN bandwidth IS NULL OR bandwidth = 0 THEN 0 ELSE bandwidth END) ASC 
+        LIMIT 1
+      `).first();
+      
+      if (worstIP && (bandwidth || 0) > (worstIP.bandwidth || 0)) {
+        await env.DB.prepare('DELETE FROM backup_quality_ips WHERE ip = ?').bind(worstIP.ip).run();
+        await addSystemLog(env, `🔄 替换备用池IP: ${worstIP.ip}(带宽${worstIP.bandwidth || 0}Mbps) → ${ip}(带宽${bandwidth || 0}Mbps)`);
+      } else {
+        await addSystemLog(env, `⏭️ ${ip} - 备用池已满(${maxBackupPoolSize})且带宽不高于池中最低带宽，跳过`);
+        return { success: false, reason: 'pool_full_and_low_bandwidth' };
+      }
+    }
+    
+    // 插入新IP
+    await env.DB.prepare(`
+      INSERT INTO backup_quality_ips (ip, latency, bandwidth, country, city, last_tested) 
+      VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+    `).bind(ip, latency, bandwidth || null, geo.country, geo.city).run();
+    
+    const newCount = await env.DB.prepare('SELECT COUNT(*) as count FROM backup_quality_ips').first();
+    await addSystemLog(env, `📌 ${ip} (${geo.country}) - ${latency}ms, ${bandwidth || 0}Mbps, 评分${score} 已加入备用池 (${newCount.count}/${maxBackupPoolSize})`);
+    
+    return { success: true, action: 'added' };
+  } catch (e) {
+    await addSystemLog(env, `❌ 添加IP到备用池失败 ${ip}: ${e.message}`);
+    return { success: false, reason: 'error', error: e.message };
+  }
 }
 
 async function cleanLatencyPool(env) {
-  try {
-    const countResult = await env.DB.prepare('SELECT COUNT(*) as count FROM latency_quality_ips').first();
-    let currentCount = countResult ? countResult.count : 0;
-    
-    if (currentCount > 30) {
-      const excess = currentCount - 30;
-      const worstIPs = await env.DB.prepare('SELECT ip, latency FROM latency_quality_ips ORDER BY latency DESC LIMIT ?').bind(excess).all();
-      
-      if (worstIPs.results && worstIPs.results.length > 0) {
-        for (const ipData of worstIPs.results) {
-          await env.DB.prepare('DELETE FROM latency_quality_ips WHERE ip = ?').bind(ipData.ip).run();
-        }
-        await addSystemLog(env, `🧹 延迟池清理完成: 删除 ${excess} 个IP，当前 30/30`);
-      }
-    }
-  } catch (e) {
-    await addSystemLog(env, `❌ 延迟池清理失败: ${e.message}`);
-  }
+  // 延迟池已弃用，此函数保留为空实现以兼容旧代码
+  // 不再尝试访问 latency_quality_ips 表
+  return { success: true, message: '延迟池已弃用，无需清理' };
 }
 
 async function cleanHighQualityPool(env, force = false) {
@@ -1249,7 +1259,7 @@ async function shouldPerformBandwidthTest(ip, isRetest, latency = null) {
   return false;
 }
 
-async function speedTestWithBandwidth(env, ip, geo = null, isRetest = false, ctx = null) {
+async function speedTestWithBandwidth(env, ip, geo = null, isInPool = false, ctx = null, isRetry = false) {
   try {
     const cached = bandwidthCache.get(ip);
     if (cached) {
@@ -1287,7 +1297,10 @@ async function speedTestWithBandwidth(env, ip, geo = null, isRetest = false, ctx
     
     if (successCount === 0) {
       await addFailedIP(env, ip);
-      await addSystemLog(env, `❌ ${ip} - 延迟测试失败`);
+      // 只在非重试模式下记录日志，避免重复
+      if (!isRetry) {
+        await addSystemLog(env, `❌ ${ip} - 延迟测试失败 (3次尝试均失败)`);
+      }
       return { success: false, ip, latency: null, bandwidth: null };
     }
     
@@ -1300,8 +1313,8 @@ async function speedTestWithBandwidth(env, ip, geo = null, isRetest = false, ctx
     // 确保 geo 和 countryName 已定义
     if (!geo) geo = await getIPGeo(env, ip);
     const countryName = COUNTRY_NAMES[geo.country] || geo.country || '未知';
-    
-    const shouldTest = await shouldPerformBandwidthTest(ip, isRetest, avgLatency);
+
+    const shouldTest = await shouldPerformBandwidthTest(ip, isInPool, avgLatency);
     
     if (shouldTest) {
       try {
@@ -1367,8 +1380,8 @@ async function speedTestWithBandwidth(env, ip, geo = null, isRetest = false, ctx
     
     const isHighQuality = (bandwidthMbps || 0) >= 100;
     const isExcellentBandwidth = (bandwidthMbps || 0) >= 500;
-    
-    if (isRetest && (inBandwidthPool || inBackupPool)) {
+
+    if (isInPool && (inBandwidthPool || inBackupPool)) {
       if (isHighQuality || isExcellentBandwidth) {
         if (inBackupPool) {
           await env.DB.prepare('DELETE FROM backup_quality_ips WHERE ip = ?').bind(ip).run();
@@ -1376,7 +1389,7 @@ async function speedTestWithBandwidth(env, ip, geo = null, isRetest = false, ctx
           await addSystemLog(env, `⬆️ ${ip} 带宽优秀，从备用池升级到带宽池`);
         } else if (inBandwidthPool) {
           await env.DB.prepare(`
-            UPDATE high_quality_ips 
+            UPDATE high_quality_ips
             SET latency = ?, bandwidth = ?, country = ?, city = ?, last_tested = CURRENT_TIMESTAMP, quality_type = 'bandwidth'
             WHERE ip = ?
           `).bind(avgLatency, bandwidthMbps || null, geo.country, geo.city, ip).run();
@@ -1401,8 +1414,11 @@ async function speedTestWithBandwidth(env, ip, geo = null, isRetest = false, ctx
     }
     
     const bandwidthInfo = bandwidthMbps ? ` | 带宽: ${bandwidthMbps} Mbps ${bandwidthLevel.star}` : ' | 带宽: 估算值';
-    await addSystemLog(env, `✅ ${ip} (${countryName}) - 延迟:${avgLatency}ms ${bandwidthInfo} | 评分:${score}`);
-    
+    // 只在非重试模式下记录成功日志，避免重复
+    if (!isRetry) {
+      await addSystemLog(env, `✅ ${ip} (${countryName}) - 延迟:${avgLatency}ms ${bandwidthInfo} | 评分:${score}`);
+    }
+
     return { 
       success: true, ip, latency: avgLatency, minLatency, maxLatency: Math.max(...latencyResults.filter(r => r !== null)),
       bandwidth: bandwidthMbps, downloadSpeed, bandwidthLevel: bandwidthLevel.level,
@@ -1415,7 +1431,7 @@ async function speedTestWithBandwidth(env, ip, geo = null, isRetest = false, ctx
 }
 
 async function smartSpeedTest(env, options = {}, ctx = null) {
-  const { maxConcurrent = 2, batchDelay = 2000, maxRetries = 1, timeout = 10000 } = options;
+  const { maxConcurrent = 1, batchDelay = 3000, maxRetries = 1, timeout = 10000 } = options;
   
   bandwidthTestCount = 0;
   lastBandwidthTestReset = Date.now();
@@ -1425,102 +1441,163 @@ async function smartSpeedTest(env, options = {}, ctx = null) {
   
   try {
     await cleanHighQualityPool(env);
-    
+
     const uiConfig = await env.KV.get(CONFIG.kvKeys.uiConfig, 'json') || {};
     const config = getEnvConfig(env);
     const advancedConfig = await getAdvancedConfig(env);
     const maxPoolSize = advancedConfig.maxHighQualityPoolSize;
-    
+
     const bandwidthPoolIPs = await getBandwidthPoolIPs(env);
     const currentBandwidthCount = bandwidthPoolIPs.length;
-    
+
     let finalTestCount = uiConfig.testCount || config.defaultTestCount;
+    const userSetCount = uiConfig.testCount || config.defaultTestCount;
+    
     if (currentBandwidthCount >= maxPoolSize * 0.9) {
       finalTestCount = Math.min(finalTestCount, 30);
     } else if (currentBandwidthCount < maxPoolSize * 0.3) {
+      // 当池较空时，增加测试数量以快速补充池子
       finalTestCount = Math.min(finalTestCount * 1.5, 100);
     }
+    
+    // 始终限制最大测试数量
+    finalTestCount = Math.min(finalTestCount, 100);
     
     const existingIPs = new Set([...bandwidthPoolIPs.map(ip => ip.ip)]);
     const allIPs = await getAllIPs(env);
     
     // 按优先级排序：历史高带宽IP > 带宽优质池 > 延迟池（备用池） > 总IP池 > 失败池
+    // IP质量衰减机制：根据最后测试时间降低优先级（7天衰减50%）
     const highBandwidthIPs = await env.DB.prepare(`
-      SELECT ip, bandwidth 
+      SELECT ip, bandwidth, 
+             (bandwidth * (1.0 - MIN((julianday('now') - julianday(last_tested)) / 14.0, 0.5))) as decayed_bandwidth
       FROM speed_results 
       WHERE bandwidth >= 100 
-      ORDER BY bandwidth DESC 
+        AND julianday('now') - julianday(last_tested) < 30  -- 30天内的测试结果
+      ORDER BY decayed_bandwidth DESC 
       LIMIT 50
     `).all();
     
     const highBandwidthIPList = (highBandwidthIPs.results || []).map(item => item.ip);
     const highBandwidthIPSet = new Set(highBandwidthIPList);
     
-    // 分离IP池
-    const bandwidthPoolIPSet = new Set(bandwidthPoolIPs.map(ip => ip.ip));
-    const newIPs = allIPs.filter(ip => !existingIPs.has(ip));
-    
-    // 构建测试队列
-    let ipsToTest = [];
-    
-    // 1. 历史高带宽IP（未在池中的）
+    // 1. 获取历史高带宽IP
     const highBandwidthNewIPs = highBandwidthIPList.filter(ip => !existingIPs.has(ip));
-    ipsToTest.push(...highBandwidthNewIPs);
     
-    // 2. 带宽优质池IP（需要重新测试的）
-    const bandwidthPoolRetest = bandwidthPoolIPs
-      .sort((a, b) => (b.bandwidth || 0) - (a.bandwidth || 0))
-      .map(ip => ip.ip);
-    ipsToTest.push(...bandwidthPoolRetest);
-    
-    // 3. 备用池IP
+    // 2. 获取备用池IP
     const backupPoolIPs = await env.DB.prepare(`
       SELECT ip, bandwidth 
       FROM backup_quality_ips 
       ORDER BY (CASE WHEN bandwidth IS NULL OR bandwidth = 0 THEN 0 ELSE bandwidth END) DESC
     `).all();
-    const backupPoolRetest = (backupPoolIPs.results || [])
-      .map(ip => ip.ip);
-    ipsToTest.push(...backupPoolRetest);
+    const backupPoolIPList = (backupPoolIPs.results || []).map(ip => ip.ip);
     
-    // 4. 总IP池中的新IP
-    ipsToTest.push(...newIPs);
+    // 3. 获取新IP（不在任何池中的）
+    const newIPs = allIPs.filter(ip => !existingIPs.has(ip) && !new Set(backupPoolIPList).has(ip));
+    
+    // 4. 获取失败池恢复IP
+    const recoverableFailedIPs = await env.DB.prepare(`
+      SELECT f.ip 
+      FROM failed_ips f
+      LEFT JOIN high_quality_ips h ON f.ip = h.ip
+      LEFT JOIN backup_quality_ips b ON f.ip = b.ip
+      WHERE julianday('now') - julianday(f.failed_at) > ?
+      AND h.ip IS NULL AND b.ip IS NULL
+      ORDER BY f.failed_at ASC
+      LIMIT 20
+    `).bind(advancedConfig.failedIpCooldownDays).all();
+    const recoverableIPs = (recoverableFailedIPs.results || []).map(item => item.ip);
+    
+    // 智能抽样：按优先级分配测试名额
+    const testSlots = {
+      newIPs: Math.floor(finalTestCount * 0.5),  // 新IP 50%
+      highBandwidthNewIPs: Math.floor(finalTestCount * 0.2),  // 历史高带宽新IP 20%
+      bandwidthPoolIPs: Math.floor(finalTestCount * 0.15),  // 带宽池IP 15%
+      recoverableIPs: Math.floor(finalTestCount * 0.05),  // 失败池恢复 5%
+      backupPoolIPs: Math.floor(finalTestCount * 0.1)  // 备用池IP 10%
+    };
+    
+    // 构建测试队列
+    let ipsToTest = [];
+    
+    // 1. 新IP（优先级最高）
+    if (newIPs.length > 0) {
+      const sampledNewIPs = shuffleArray(newIPs).slice(0, testSlots.newIPs);
+      ipsToTest.push(...sampledNewIPs);
+    }
+    
+    // 2. 历史高带宽新IP
+    if (highBandwidthNewIPs.length > 0) {
+      const sampledHighBandwidthIPs = shuffleArray(highBandwidthNewIPs).slice(0, testSlots.highBandwidthNewIPs);
+      ipsToTest.push(...sampledHighBandwidthIPs);
+    }
+    
+    // 3. 带宽池IP（需要重新测试的）
+    if (bandwidthPoolIPs.length > 0) {
+      const sampledBandwidthPoolIPs = shuffleArray(bandwidthPoolIPs.map(ip => ip.ip)).slice(0, testSlots.bandwidthPoolIPs);
+      ipsToTest.push(...sampledBandwidthPoolIPs);
+    }
+    
+    // 4. 备用池IP
+    if (backupPoolIPList.length > 0) {
+      const sampledBackupIPs = shuffleArray(backupPoolIPList).slice(0, testSlots.backupPoolIPs);
+      ipsToTest.push(...sampledBackupIPs);
+    }
+    
+    // 5. 失败池恢复IP
+    if (recoverableIPs.length > 0) {
+      const sampledRecoverableIPs = shuffleArray(recoverableIPs).slice(0, testSlots.recoverableIPs);
+      ipsToTest.push(...sampledRecoverableIPs);
+      if (sampledRecoverableIPs.length > 0) {
+        await addSystemLog(env, `🔄 失败池自动恢复: ${sampledRecoverableIPs.length} 个IP冷却期已过，重新加入测速队列`);
+      }
+    }
     
     // 去重并限制数量
     ipsToTest = [...new Set(ipsToTest)].slice(0, finalTestCount);
     
-    // 随机排序测试队列
-    ipsToTest = ipsToTest.sort(() => 0.5 - Math.random());
+    // 再次随机排序，确保测试分布均匀
+    ipsToTest = shuffleArray(ipsToTest);
     
     if (ipsToTest.length === 0) {
       await addSystemLog(env, 'ℹ️ 没有需要测试的IP');
       return { success: true, message: '无需测试' };
     }
     
-    await addSystemLog(env, `📊 智能测速: 测试 ${ipsToTest.length} 个IP`);
-    
+    await addSystemLog(env, `📊 智能测速: 测试 ${ipsToTest.length} 个IP (设置数量: ${uiConfig.testCount || config.defaultTestCount}, 实际计算: ${finalTestCount})`);
+
     const batchSize = Math.min(maxConcurrent, 2);
     const existingSet = new Set(existingIPs);
-    
+
     let successCount = 0;
     let failCount = 0;
+    let totalTestAttempts = 0; // 总测试次数（包括重试）
     
     for (let i = 0; i < ipsToTest.length; i += batchSize) {
       const batch = ipsToTest.slice(i, i + batchSize);
-      
+
       for (let j = 0; j < batch.length; j++) {
         const ip = batch[j];
         let lastError = null;
         let result = null;
-        
+
+        let testSuccess = false;
+        let retryCount = 0;
         for (let retry = 0; retry <= maxRetries; retry++) {
+          retryCount++;
+          totalTestAttempts++;
           try {
+            // isInPool: IP是否已在带宽池中
+            // isRetry: 是否是重试调用(retry > 0)
+            const isInPool = existingSet.has(ip);
+            const isRetry = retry > 0;
             result = await Promise.race([
-              speedTestWithBandwidth(env, ip, null, existingSet.has(ip), ctx),
+              speedTestWithBandwidth(env, ip, null, isInPool, ctx, isRetry),
               new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), timeout))
             ]);
             if (result.success) {
               successCount++;
+              testSuccess = true;
               break;
             }
             lastError = result.error;
@@ -1531,9 +1608,13 @@ async function smartSpeedTest(env, options = {}, ctx = null) {
             }
           }
         }
-        
-        if (!result || !result.success) {
+
+        if (!testSuccess) {
           failCount++;
+        }
+        // 记录每个IP的测试次数
+        if (retryCount > 1) {
+          await addSystemLog(env, `🔄 ${ip} 测试了 ${retryCount} 次才结束`);
         }
         
         if (j < batch.length - 1) {
@@ -1553,11 +1634,35 @@ async function smartSpeedTest(env, options = {}, ctx = null) {
     geoCache.clear();
     await cleanHighQualityPool(env);
     await cleanLatencyPool(env);
+    
+    // 备用池主动升级策略：当带宽池较空时，主动将备用池的优质IP升级到带宽池
+    const finalBandwidthCount = (await getBandwidthPoolIPs(env)).length;
+    if (finalBandwidthCount < maxPoolSize * 0.5) {
+      const neededSlots = Math.floor(maxPoolSize * 0.5) - finalBandwidthCount;
+      const bestBackupIPs = await env.DB.prepare(`
+        SELECT ip, latency, bandwidth, country, city
+        FROM backup_quality_ips
+        ORDER BY bandwidth DESC, latency ASC
+        LIMIT ?
+      `).bind(Math.min(neededSlots, 5)).all();  // 每次最多升级5个
+      
+      if (bestBackupIPs.results && bestBackupIPs.results.length > 0) {
+        for (const ipData of bestBackupIPs.results) {
+          const score = calculateIPScore(ipData.latency, ipData.bandwidth || 0);
+          const geo = { country: ipData.country, city: ipData.city };
+          await addToBandwidthPool(env, ipData.ip, ipData.latency, ipData.bandwidth, geo, score);
+          // 从备用池删除
+          await env.DB.prepare('DELETE FROM backup_quality_ips WHERE ip = ?').bind(ipData.ip).run();
+        }
+        await addSystemLog(env, `⬆️ 备用池主动升级: ${bestBackupIPs.results.length} 个优质IP升级到带宽池`);
+      }
+    }
+    
     await updateRegionStats(env);
     await updateRegionQuality(env);
     
     const newBandwidthCount = (await getBandwidthPoolIPs(env)).length;
-    await addSystemLog(env, `✅ 测速完成 | 成功: ${successCount}, 失败: ${failCount} | 带宽池: ${newBandwidthCount}/${maxPoolSize}`);
+    await addSystemLog(env, `✅ 测速完成 | 成功: ${successCount}, 失败: ${failCount} | 总测试次数: ${totalTestAttempts} | 带宽池: ${newBandwidthCount}/${maxPoolSize}`);
     await sendTelegramNotification(env, {
       message: {
         ipCount: successCount,
@@ -1573,22 +1678,51 @@ async function smartSpeedTest(env, options = {}, ctx = null) {
     
     // 检查是否需要在测速完成后自动更新DNS
     const dnsConfig = await env.KV.get(CONFIG.kvKeys.dnsConfig, 'json');
-    await addSystemLog(env, `🔍 检查自动更新DNS: autoUpdateAfterTest=${dnsConfig?.autoUpdateAfterTest}, DNS配置完整=${!!(dnsConfig?.apiToken && dnsConfig?.zoneId && dnsConfig?.recordName)}`);
+    const countryDomains = dnsConfig?.countryDomains || {};
+    const hasCountryDomains = Object.keys(countryDomains).length > 0;
+    await addSystemLog(env, `🔍 检查自动更新DNS: autoUpdateAfterTest=${dnsConfig?.autoUpdateAfterTest}, DNS配置完整=${!!(dnsConfig?.apiToken && dnsConfig?.zoneId && (dnsConfig?.recordName || hasCountryDomains))}`);
     if (dnsConfig?.autoUpdateAfterTest) {
       const config = getEnvConfig(env);
       const uiConfig = await env.KV.get(CONFIG.kvKeys.uiConfig, 'json') || {};
       const ipCount = uiConfig.ipCount || config.defaultIpCount;
-      // 先尝试获取中国IP，如果没有则获取全球IP
-      let bestIPs = await getBestIPs(env, 'CN', ipCount);
-      await addSystemLog(env, `🔍 自动更新DNS: 找到 ${bestIPs.length} 个中国最佳IP`);
+      // 获取排序方式，默认为综合评分
+      const sortBy = dnsConfig?.autoUpdateSortBy || 'score';
+      await addSystemLog(env, `🔍 自动更新DNS排序方式: ${sortBy}`);
+      
+      // 确定要更新的国家和域名
+      let targetCountry = 'CN';
+      let targetDomain = dnsConfig?.recordName;
+      
+      // 如果有国家域名映射，优先使用国家域名
+      if (hasCountryDomains) {
+        // 优先尝试中国域名
+        if (countryDomains['CN']) {
+          targetCountry = 'CN';
+          targetDomain = countryDomains['CN'];
+        } else {
+          // 如果没有中国域名，使用第一个国家
+          const firstCountry = Object.keys(countryDomains)[0];
+          targetCountry = firstCountry;
+          targetDomain = countryDomains[firstCountry];
+        }
+      }
+      
+      // 先尝试获取目标国家IP，如果没有则获取全球IP
+      let bestIPs = await getBestIPs(env, targetCountry, ipCount, sortBy);
+      await addSystemLog(env, `🔍 自动更新DNS: 找到 ${bestIPs.length} 个${targetCountry}最佳IP`);
       if (bestIPs.length === 0) {
-        await addSystemLog(env, `🔍 没有找到中国IP，尝试获取全球最佳IP`);
-        bestIPs = await getBestIPs(env, null, ipCount);
+        await addSystemLog(env, `🔍 没有找到${targetCountry} IP，尝试获取全球最佳IP`);
+        bestIPs = await getBestIPs(env, null, ipCount, sortBy);
         await addSystemLog(env, `🔍 自动更新DNS: 找到 ${bestIPs.length} 个全球最佳IP`);
       }
       if (bestIPs.length > 0) {
-        await updateDNSBatch(env, bestIPs.map(item => item.ip), 'auto_after_test');
-        await addSystemLog(env, `🌍 测速完成后自动更新DNS: ${bestIPs.length} 个IP`);
+        // 使用 ctx.waitUntil 让DNS更新在后台执行，避免占用子请求配额
+        if (ctx) {
+          ctx.waitUntil(updateDNSBatch(env, bestIPs.map(item => item.ip), 'auto_after_test', targetDomain));
+        } else {
+          await updateDNSBatch(env, bestIPs.map(item => item.ip), 'auto_after_test', targetDomain);
+        }
+        await addSystemLog(env, `🌍 测速完成后自动更新DNS: ${bestIPs.length} 个IP (域名: ${targetDomain || '默认'})`);
       } else {
         await addSystemLog(env, `⚠️ 自动更新DNS失败: 没有找到最佳IP`);
       }
@@ -1617,6 +1751,8 @@ async function updateRegionData(env, type = 'quality') {
       FROM high_quality_ips WHERE country != 'unknown' GROUP BY country
     `).all();
     
+    await addSystemLog(env, `🌍 更新区域数据: 从 high_quality_ips 获取到 ${stats.results?.length || 0} 个地区`);
+    
     const operations = [];
     for (const stat of stats.results || []) {
       if (isQuality) {
@@ -1631,8 +1767,15 @@ async function updateRegionData(env, type = 'quality') {
         `).bind(stat.country, stat.ip_count, Math.round(stat.avg_latency), stat.avg_bandwidth ? Math.round(stat.avg_bandwidth * 10) / 10 : null));
       }
     }
-    if (operations.length > 0) await env.DB.batch(operations);
-  } catch (e) {}
+    if (operations.length > 0) {
+      await env.DB.batch(operations);
+      await addSystemLog(env, `✅ 已更新 ${operations.length} 个地区数据到 ${tableName}`);
+    } else {
+      await addSystemLog(env, `⚠️ 没有地区数据需要更新到 ${tableName}`);
+    }
+  } catch (e) {
+    await addSystemLog(env, `❌ 更新区域数据失败: ${e.message}`);
+  }
 }
 
 // 兼容性别名
@@ -1642,87 +1785,6 @@ async function updateRegionQuality(env) {
 
 async function updateRegionStats(env) {
   return updateRegionData(env, 'stats');
-}
-
-async function getSpeedStrategy(env) {
-  try {
-    let strategy = await env.DB.prepare('SELECT last_region, last_maintain_time, global_maintain_count FROM speed_strategy WHERE id = 1').first();
-    if (!strategy) {
-      await env.DB.prepare(`INSERT INTO speed_strategy (id, last_region, last_maintain_time, global_maintain_count) VALUES (1, 'CN', CURRENT_TIMESTAMP, 0)`).run();
-      strategy = { last_region: 'CN', last_maintain_time: new Date().toISOString(), global_maintain_count: 0 };
-    }
-    
-    let regionStats;
-    try {
-      regionStats = await env.DB.prepare(`SELECT country, ip_count FROM region_quality WHERE country IN ('CN','JP','KR','SG','HK','TW')`).all();
-    } catch (e) {
-      regionStats = { results: [] };
-    }
-    
-    const countMap = new Map();
-    for (const stat of regionStats.results || []) countMap.set(stat.country, stat.ip_count);
-    
-    let minCountry = 'CN', minCount = 100;
-    for (const region of ASIA_REGIONS) {
-      const count = countMap.get(region) || 0;
-      if (count < minCount) { minCount = count; minCountry = region; }
-    }
-    
-    if (countMap.size === 0) {
-      minCountry = 'CN';
-      minCount = 0;
-    }
-    
-    const now = new Date();
-    const asiaHour = (now.getHours() + 8) % 24;
-    const lastMaintain = new Date(strategy.last_maintain_time);
-    const hoursSinceMaintain = (now - lastMaintain) / (1000 * 60 * 60);
-    
-    let globalCount = strategy.global_maintain_count || 0;
-    
-    if (minCount < 10) return { type: 'urgent', country: minCountry, count: minCount };
-    if (hoursSinceMaintain > 24) return { type: 'maintain', country: minCountry, count: minCount };
-    if (asiaHour >= 0 && asiaHour < 6 && new Date().getDay() === 0) {
-      globalCount++;
-      return { type: 'global', globalCount: globalCount };
-    }
-    if (asiaHour >= 0 && asiaHour < 6) return { type: 'global', globalCount: globalCount };
-    
-    const regionOrder = ['CN', 'JP', 'KR', 'SG', 'HK', 'TW'];
-    let currentIndex = regionOrder.indexOf(strategy.last_region);
-    let nextIndex = (currentIndex + 1) % regionOrder.length;
-    let nextCountry = regionOrder[nextIndex];
-    
-    if ((countMap.get(nextCountry) || 0) > 30) {
-      nextIndex = (nextIndex + 1) % regionOrder.length;
-      nextCountry = regionOrder[nextIndex];
-    }
-    
-    return { type: 'maintain', country: nextCountry, count: countMap.get(nextCountry) || 0 };
-  } catch (e) {
-    const now = new Date();
-    const asiaHour = (now.getHours() + 8) % 24;
-    if (asiaHour >= 0 && asiaHour < 6) {
-      return { type: 'global', globalCount: 0 };
-    }
-    return { type: 'maintain', country: 'CN', count: 0 };
-  }
-}
-
-async function updateSpeedStrategy(env, targetCountry) {
-  try {
-    const now = new Date();
-    const asiaHour = (now.getHours() + 8) % 24;
-    let globalInc = (!targetCountry && asiaHour >= 0 && asiaHour < 6) ? 1 : 0;
-    
-    const current = await env.DB.prepare('SELECT global_maintain_count FROM speed_strategy WHERE id = 1').first();
-    const newCount = (current?.global_maintain_count || 0) + globalInc;
-    
-    await env.DB.prepare(`
-      INSERT OR REPLACE INTO speed_strategy (id, last_region, last_maintain_time, global_maintain_count, updated_at)
-      VALUES (1, ?, CURRENT_TIMESTAMP, ?, CURRENT_TIMESTAMP)
-    `).bind(targetCountry || 'CN', newCount).run();
-  } catch (e) {}
 }
 
 async function getTotalIPCount(env) {
@@ -1778,14 +1840,35 @@ async function updateIPs(env) {
 
   const ipList = Array.from(allIPs).sort(compareIPs);
   await env.KV.put(CONFIG.kvKeys.ipList, JSON.stringify(ipList));
-  await env.KV.put(CONFIG.kvKeys.lastUpdate, new Date().toLocaleString('zh-CN'));
+  await env.KV.put(CONFIG.kvKeys.lastUpdate, new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false }));
   await addSystemLog(env, `🔄 IP列表已更新: ${ipList.length} 个IP`);
   return ipList;
 }
 
-async function getBestIPs(env, visitorCountry, count) {
+async function getBestIPs(env, visitorCountry, count, sortBy = 'score') {
   let bestIPs = [];
   const filterCountry = visitorCountry && visitorCountry !== 'unknown';
+
+  // 根据排序方式构建ORDER BY子句
+  let orderByClause;
+  switch (sortBy) {
+    case 'bandwidth':
+      // 带宽优先：按带宽降序，延迟升序
+      orderByClause = '(CASE WHEN bandwidth IS NULL OR bandwidth = 0 THEN 0 ELSE bandwidth END) DESC, latency ASC';
+      break;
+    case 'latency':
+      // 延迟优先：按延迟升序，带宽降序
+      orderByClause = 'latency ASC, (CASE WHEN bandwidth IS NULL OR bandwidth = 0 THEN 0 ELSE bandwidth END) DESC';
+      break;
+    case 'score':
+    default:
+      // 综合评分优先：按评分降序（带宽80% + 延迟20%）
+      orderByClause = `(CASE 
+        WHEN bandwidth IS NULL OR bandwidth = 0 THEN 0 
+        ELSE (bandwidth * 0.8 + (100 - CASE WHEN latency > 100 THEN 0 ELSE 100 - latency END) * 0.2) 
+      END) DESC, latency ASC`;
+      break;
+  }
 
   try {
     // 先从带宽池获取
@@ -1793,7 +1876,7 @@ async function getBestIPs(env, visitorCountry, count) {
       SELECT ip, latency, bandwidth, country
       FROM high_quality_ips
       ${filterCountry ? 'WHERE country = ?' : ''}
-      ORDER BY (CASE WHEN bandwidth IS NULL OR bandwidth = 0 THEN 0 ELSE bandwidth END) DESC, latency ASC
+      ORDER BY ${orderByClause}
       LIMIT ?
     `;
     const bwStmt = env.DB.prepare(bwSql);
@@ -1812,7 +1895,7 @@ async function getBestIPs(env, visitorCountry, count) {
         SELECT ip, latency, bandwidth, country
         FROM backup_quality_ips
         ${filterCountry ? 'WHERE country = ?' : ''}
-        ORDER BY (CASE WHEN bandwidth IS NULL OR bandwidth = 0 THEN 0 ELSE bandwidth END) DESC, latency ASC
+        ORDER BY ${orderByClause}
         LIMIT ?
       `;
       const backupStmt = env.DB.prepare(backupSql);
@@ -1838,7 +1921,7 @@ async function getBestIPs(env, visitorCountry, count) {
   }
   
   const result = Array.from(uniqueIPs.values()).slice(0, count);
-  await addSystemLog(env, `📊 获取最佳IP: ${result.length} 个 (请求: ${count}, 过滤: ${filterCountry ? visitorCountry : '全球'})`);
+  await addSystemLog(env, `📊 获取最佳IP: ${result.length} 个 (请求: ${count}, 排序: ${sortBy}, 过滤: ${filterCountry ? visitorCountry : '全球'})`);
   
   return result.map(item => ({
     ip: item.ip, latency: item.latency, bandwidth: item.bandwidth, 
@@ -1891,7 +1974,10 @@ async function getPoolStats(env, type = 'bandwidth') {
         }
       };
     } else if (type === 'backup') {
-      const maxBackupPoolSize = 50;
+      const advancedConfig = await getAdvancedConfig(env);
+      const maxBackupPoolSize = advancedConfig.maxBackupPoolSize || 50;
+      
+      await addSystemLog(env, `🔍 获取备用池统计: maxBackupPoolSize=${maxBackupPoolSize}`);
       
       const allIPs = await env.DB.prepare(`
         SELECT ip, latency, bandwidth 
@@ -1936,86 +2022,86 @@ async function getPoolStats(env, type = 'bandwidth') {
   }
 }
 
-async function updateDNSBatch(env, ips, triggerSource = 'manual') {
+async function updateDNSBatch(env, ips, triggerSource = 'manual', recordName = null) {
   try {
     const dnsConfig = await env.KV.get(CONFIG.kvKeys.dnsConfig, 'json');
-    if (!dnsConfig || !dnsConfig.apiToken || !dnsConfig.zoneId || !dnsConfig.recordName) {
+    if (!dnsConfig || !dnsConfig.apiToken || !dnsConfig.zoneId) {
       return { success: false, error: 'DNS配置不完整，请先在设置页面配置DNS' };
     }
-    
+
     if (!ips || ips.length === 0) {
       return { success: false, error: '没有可用的IP地址' };
     }
-    
+
+    // 使用传入的记录名或默认记录名
+    const targetRecordName = recordName || dnsConfig.recordName;
+    if (!targetRecordName) {
+      return { success: false, error: '域名未配置，请在设置页面配置域名记录或国家域名映射' };
+    }
+
+    // 使用传入的IP列表
+    const limitedIPs = ips;
+
     const url = `https://api.cloudflare.com/client/v4/zones/${dnsConfig.zoneId}/dns_records`;
-    const listResp = await fetch(`${url}?type=A&name=${dnsConfig.recordName}`, {
+
+    // 获取现有DNS记录列表
+    const listResp = await fetch(`${url}?type=A&name=${targetRecordName}`, {
       headers: { 'Authorization': `Bearer ${dnsConfig.apiToken}` }
     });
     const listData = await listResp.json();
-    
+
+    // 批量删除现有记录
     if (listData.success && listData.result.length > 0) {
-      for (const record of listData.result) {
-        await fetch(`${url}/${record.id}`, { method: 'DELETE', headers: { 'Authorization': `Bearer ${dnsConfig.apiToken}` } });
-      }
+      const deletePromises = listData.result.map(record =>
+        fetch(`${url}/${record.id}`, { method: 'DELETE', headers: { 'Authorization': `Bearer ${dnsConfig.apiToken}` } })
+      );
+      await Promise.all(deletePromises);
     }
-    
-    let successCount = 0;
-    for (const ip of ips) {
-      const createResp = await fetch(url, {
+
+    // 批量创建新记录
+    const createPromises = limitedIPs.map(ip =>
+      fetch(url, {
         method: 'POST',
         headers: { 'Authorization': `Bearer ${dnsConfig.apiToken}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ type: 'A', name: dnsConfig.recordName, content: ip, ttl: 120, proxied: dnsConfig.proxied || false })
-      });
+        body: JSON.stringify({ type: 'A', name: targetRecordName, content: ip, ttl: 120, proxied: dnsConfig.proxied || false })
+      })
+    );
+    const createResults = await Promise.all(createPromises);
+
+    // 统计成功数量
+    let successCount = 0;
+    for (const createResp of createResults) {
       const result = await createResp.json();
       if (result.success) successCount++;
     }
-    
+
     if (successCount > 0) {
-      await addSystemLog(env, `✅ DNS更新成功: ${successCount} 个IP (来源: ${triggerSource})`);
-      
+      await addSystemLog(env, `✅ DNS更新成功: ${successCount} 个IP (域名: ${targetRecordName}, 来源: ${triggerSource})`);
+
       // 获取IP的详细信息
       let ipDetails = [];
-      for (const ip of ips) {
-        try {
-          const result = await env.DB.prepare('SELECT latency, bandwidth FROM high_quality_ips WHERE ip = ?').bind(ip).first();
-          if (result) {
-            ipDetails.push({
-              ip: ip,
-              latency: result.latency,
-              bandwidth: result.bandwidth
-            });
-          }
-        } catch (e) {
-          // 忽略错误，继续处理其他IP
+      const placeholders = limitedIPs.map(() => '?').join(',');
+      try {
+        const results = await env.DB.prepare(
+          `SELECT ip, latency, bandwidth FROM high_quality_ips WHERE ip IN (${placeholders})`
+        ).bind(...limitedIPs).all();
+
+        if (results.results) {
+          ipDetails = results.results.map(result => ({
+            ip: result.ip,
+            latency: result.latency,
+            bandwidth: result.bandwidth
+          }));
         }
+      } catch (e) {
+        // 忽略错误，继续处理
       }
       
-      // 构建IP列表消息
-      let ipListMessage = '';
-      ipDetails.forEach((ipDetail, index) => {
-        // 根据配置决定是否隐藏IP
-        let displayIP = ipDetail.ip;
-        if (dnsConfig.telegramHideIP !== false) {
-          // 隐藏IP后三位，只保留第一位
-          displayIP = ipDetail.ip.split('.')[0] + '.*.*.*';
-        }
-        ipListMessage += (index + 1) + ". " + displayIP + " (延迟: " + ipDetail.latency + "ms, 带宽: " + (ipDetail.bandwidth || '未知') + "Mbps)\n";
-      });
-      
-      // 构建完整通知消息
-      const sourceText = getSourceText(triggerSource);
-      const notificationMessage = "🌐 *DNS更新通知*\n\n" +
-        "📅 *时间*: " + new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false }) + "\n" +
-        "📍 *IP数量*: " + successCount + " 个\n" +
-        "🎯 *来源*: " + sourceText + "\n" +
-        "🔗 *域名*: " + dnsConfig.recordName + "\n\n" +
-        "✨ *优选IP列表*\n" +
-        (ipListMessage || '暂无详细信息');
       await sendTelegramNotification(env, {
         message: {
           ipCount: successCount,
-          source: sourceText,
-          domain: dnsConfig.recordName,
+          source: getSourceText(triggerSource),
+          domain: targetRecordName,
           ips: ipDetails.map(ipDetail => ({
             ip: ipDetail.ip,
             latency: ipDetail.latency,
@@ -2026,25 +2112,180 @@ async function updateDNSBatch(env, ips, triggerSource = 'manual') {
         type: 'success'
       });
     } else {
-      const sourceText = getSourceText(triggerSource);
       await sendTelegramNotification(env, {
         message: {
           ipCount: 0,
-          source: sourceText,
-          domain: dnsConfig.recordName
+          source: getSourceText(triggerSource),
+          domain: targetRecordName
         },
         type: 'error'
       });
     }
-    return { success: successCount > 0, count: successCount };
+    return { success: successCount > 0, count: successCount, domain: targetRecordName };
   } catch (e) {
     await addSystemLog(env, `❌ DNS更新失败: ${e.message}`);
     return { success: false, error: e.message, count: 0 };
   }
 }
 
+async function updateDNSByCountry(env, country, ips, triggerSource = 'manual') {
+  try {
+    const dnsConfig = await env.KV.get(CONFIG.kvKeys.dnsConfig, 'json');
+    if (!dnsConfig || !dnsConfig.apiToken || !dnsConfig.zoneId) {
+      return { success: false, error: 'DNS配置不完整' };
+    }
+
+    // 检查是否有对应国家的域名配置
+    const countryDomains = dnsConfig.countryDomains || {};
+    const countryDomain = countryDomains[country];
+
+    if (!countryDomain) {
+      return { success: false, error: `未配置 ${country} 国家的域名` };
+    }
+
+    return await updateDNSBatch(env, ips, triggerSource, countryDomain);
+  } catch (e) {
+    await addSystemLog(env, `❌ 按国家更新DNS失败: ${e.message}`);
+    return { success: false, error: e.message };
+  }
+}
+
+async function updateDNSForAllCountries(env, triggerSource = 'manual') {
+  try {
+    const dnsConfig = await env.KV.get(CONFIG.kvKeys.dnsConfig, 'json');
+    if (!dnsConfig || !dnsConfig.apiToken || !dnsConfig.zoneId) {
+      return { success: false, error: 'DNS配置不完整' };
+    }
+
+    const countryDomains = dnsConfig.countryDomains || {};
+    const countryCodes = Object.keys(countryDomains);
+
+    if (countryCodes.length === 0) {
+      return { success: false, error: '未配置国家域名映射' };
+    }
+
+    const results = [];
+    const config = getEnvConfig(env);
+    const ipCount = config.defaultIpCount;
+
+    for (const country of countryCodes) {
+      const bestIPs = await getBestIPs(env, country, ipCount);
+      if (bestIPs.length > 0) {
+        const result = await updateDNSByCountry(env, country, bestIPs.map(item => item.ip), triggerSource);
+        results.push({ country, ...result });
+        // 延迟一下，避免API限流
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      } else {
+        await addSystemLog(env, `⚠️ 国家 ${country} 没有可用的IP`);
+        results.push({ country, success: false, error: '没有可用的IP' });
+      }
+    }
+
+    const successCount = results.filter(r => r.success).length;
+    await addSystemLog(env, `🌍 按国家更新DNS完成: 成功 ${successCount}/${results.length} 个国家`);
+
+    return { success: successCount > 0, results, successCount, totalCount: results.length };
+  } catch (e) {
+    await addSystemLog(env, `❌ 批量按国家更新DNS失败: ${e.message}`);
+    return { success: false, error: e.message };
+  }
+}
+
+async function updateDNSSmartRouting(env, triggerSource = 'manual') {
+  try {
+    const dnsConfig = await env.KV.get(CONFIG.kvKeys.dnsConfig, 'json');
+    if (!dnsConfig || !dnsConfig.apiToken || !dnsConfig.zoneId) {
+      return { success: false, error: 'DNS配置不完整' };
+    }
+
+    const countryDomains = dnsConfig.countryDomains || {};
+    const countryCodes = Object.keys(countryDomains);
+
+    if (countryCodes.length === 0) {
+      return { success: false, error: '未配置国家域名映射' };
+    }
+
+    const config = getEnvConfig(env);
+    const ipCount = config.defaultIpCount;
+    const results = [];
+    const updatedCountries = [];
+
+    // 获取所有优质IP并按国家分组
+    const allIPs = await env.DB.prepare(`
+      SELECT ip, latency, bandwidth, country 
+      FROM high_quality_ips 
+      ORDER BY bandwidth DESC, latency ASC
+    `).all();
+
+    if (!allIPs.results || allIPs.results.length === 0) {
+      return { success: false, error: '没有可用的IP地址' };
+    }
+
+    // 按国家分组IP
+    const ipsByCountry = {};
+    for (const ip of allIPs.results) {
+      const country = ip.country || 'unknown';
+      if (!ipsByCountry[country]) {
+        ipsByCountry[country] = [];
+      }
+      ipsByCountry[country].push(ip);
+    }
+
+    await addSystemLog(env, `🧠 智能分流DNS更新: 找到 ${allIPs.results.length} 个IP，分布在 ${Object.keys(ipsByCountry).length} 个国家/地区`);
+
+    // 为每个配置的国家域名更新DNS
+    for (const country of countryCodes) {
+      let countryIPs = ipsByCountry[country] || [];
+      
+      // 如果该国家没有足够的IP，从其他国家补充
+      if (countryIPs.length < ipCount) {
+        const needed = ipCount - countryIPs.length;
+        const otherIPs = allIPs.results
+          .filter(ip => ip.country !== country)
+          .slice(0, needed);
+        countryIPs = countryIPs.concat(otherIPs);
+      }
+
+      // 取前N个最优IP
+      const bestIPs = countryIPs.slice(0, ipCount);
+
+      if (bestIPs.length > 0) {
+        const result = await updateDNSByCountry(env, country, bestIPs.map(item => item.ip), triggerSource);
+        results.push({ country, domain: countryDomains[country], ...result });
+        if (result.success) {
+          updatedCountries.push(country);
+          await addSystemLog(env, `✅ ${COUNTRY_NAMES[country] || country} DNS更新成功: ${bestIPs.length} 个IP (${countryDomains[country]})`);
+        } else {
+          await addSystemLog(env, `❌ ${COUNTRY_NAMES[country] || country} DNS更新失败: ${result.error}`);
+        }
+        // 延迟一下，避免API限流
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      } else {
+        await addSystemLog(env, `⚠️ ${COUNTRY_NAMES[country] || country} 没有可用的IP`);
+        results.push({ country, domain: countryDomains[country], success: false, error: '没有可用的IP' });
+      }
+    }
+
+    const successCount = results.filter(r => r.success).length;
+    await addSystemLog(env, `🧠 智能分流DNS更新完成: 成功 ${successCount}/${results.length} 个国家`);
+
+    return { 
+      success: successCount > 0, 
+      results, 
+      successCount, 
+      totalCount: results.length,
+      updatedCountries,
+      totalIPs: allIPs.results.length
+    };
+  } catch (e) {
+    await addSystemLog(env, `❌ 智能分流DNS更新失败: ${e.message}`);
+    return { success: false, error: e.message };
+  }
+}
+
 async function updateDNSWithVisitorAware(env, visitorCountry, count) {
   try {
+    // 首先获取最佳 IP 列表
     let bestIPs = await getBestIPs(env, visitorCountry, count);
     
     if (!bestIPs.length) {
@@ -2074,7 +2315,26 @@ async function updateDNSWithVisitorAware(env, visitorCountry, count) {
       return { success: false, error: '没有可用的IP地址，请先点击"开始测速"获取优质IP' };
     }
     
-    await addSystemLog(env, `🌍 为 ${COUNTRY_NAMES[visitorCountry] || visitorCountry} 地区更新DNS，共 ${bestIPs.length} 个IP`);
+    // 检查是否有该国家的域名配置
+    const dnsConfig = await env.KV.get(CONFIG.kvKeys.dnsConfig, 'json');
+    const countryDomains = dnsConfig?.countryDomains || {};
+    
+    // 如果有该国家的域名配置，使用按国家更新
+    if (countryDomains[visitorCountry]) {
+      await addSystemLog(env, `🌍 为 ${COUNTRY_NAMES[visitorCountry] || visitorCountry} 地区更新DNS (使用国家域名: ${countryDomains[visitorCountry]})，共 ${bestIPs.length} 个IP`);
+      return await updateDNSByCountry(env, visitorCountry, bestIPs.map(item => item.ip), 'visitor_aware');
+    }
+    
+    // 如果没有该国家的域名配置，但有其他国家域名映射，使用第一个国家域名作为默认
+    const countryCodes = Object.keys(countryDomains);
+    if (countryCodes.length > 0) {
+      const defaultCountryDomain = countryDomains[countryCodes[0]];
+      await addSystemLog(env, `🌍 为 ${COUNTRY_NAMES[visitorCountry] || visitorCountry} 地区更新DNS (回退到国家域名: ${defaultCountryDomain})，共 ${bestIPs.length} 个IP`);
+      return await updateDNSBatch(env, bestIPs.map(item => item.ip), 'visitor_aware', defaultCountryDomain);
+    }
+    
+    // 如果没有国家域名映射，使用默认的 recordName
+    await addSystemLog(env, `🌍 为 ${COUNTRY_NAMES[visitorCountry] || visitorCountry} 地区更新DNS (使用默认域名)，共 ${bestIPs.length} 个IP`);
     return await updateDNSBatch(env, bestIPs.map(item => item.ip), 'visitor_aware');
   } catch (e) {
     await addSystemLog(env, `❌ 访客感知DNS更新失败: ${e.message}`);
@@ -2132,6 +2392,7 @@ async function handleDataQuery(env, type) {
       case 'region-quality': {
         const quality = await env.DB.prepare(`SELECT country, ip_count, avg_latency, avg_bandwidth, min_latency, max_latency, last_updated FROM region_quality ORDER BY avg_latency ASC LIMIT 20`).all();
         const stats = await env.DB.prepare(`SELECT COUNT(*) as total_regions, SUM(ip_count) as total_ips, AVG(avg_latency) as global_avg_latency, AVG(avg_bandwidth) as global_avg_bandwidth FROM region_quality`).first();
+        await addSystemLog(env, `🔍 区域质量查询: ${quality.results?.length || 0} 个地区, 总IP: ${stats?.total_ips || 0}`);
         return {
           success: true,
           regions: (quality.results || []).map(r => ({
@@ -2141,13 +2402,6 @@ async function handleDataQuery(env, type) {
           })),
           summary: stats
         };
-      }
-      
-      case 'speed-strategy': {
-        const strategy = await getSpeedStrategy(env);
-        const now = new Date();
-        const asiaHour = (now.getHours() + 8) % 24;
-        return { success: true, strategy, asiaHour, nextRun: strategy.type === 'urgent' ? '立即' : '下次定时任务' };
       }
       
       default:
@@ -2167,16 +2421,12 @@ async function handleRegionQuality(env) {
   return handleDataQuery(env, 'region-quality');
 }
 
-async function handleSpeedStrategy(env) {
-  return handleDataQuery(env, 'speed-strategy');
-}
-
 async function handleDBStatus(env) {
   try {
     await env.DB.prepare("SELECT 1").run();
     const tables = await env.DB.prepare("SELECT name FROM sqlite_master WHERE type='table'").all();
     const counts = {};
-    for (const table of ['speed_results', 'high_quality_ips', 'backup_quality_ips', 'failed_ips', 'system_logs', 'region_stats', 'ip_geo_cache', 'region_quality', 'speed_strategy']) {
+    for (const table of ['speed_results', 'high_quality_ips', 'backup_quality_ips', 'failed_ips', 'system_logs', 'region_stats', 'ip_geo_cache', 'region_quality']) {
       try {
         const result = await env.DB.prepare(`SELECT COUNT(*) as count FROM ${table}`).first();
         counts[table] = result ? result.count : 0;
@@ -2190,7 +2440,6 @@ async function handleDBStatus(env) {
 
 async function handleManualInit(env) {
   const success = await initDatabase(env);
-  await runD1Migrations(env);
   const status = await handleDBStatus(env);
   await addSystemLog(env, '🗄️ 数据库手动初始化完成');
   return { success, ...status };
@@ -2385,7 +2634,8 @@ async function getMainHTML(env) {
   
   const advancedConfig = {
     maxHighQualityPoolSize: savedAdvancedConfig.maxHighQualityPoolSize || config.maxHighQualityPoolSize,
-    failedIpCooldownDays: savedAdvancedConfig.failedIpCooldownDays || config.failedIpCooldownDays
+    failedIpCooldownDays: savedAdvancedConfig.failedIpCooldownDays || config.failedIpCooldownDays,
+    maxBackupPoolSize: savedAdvancedConfig.maxBackupPoolSize || 50
   };
   
   return `<!DOCTYPE html>
@@ -2393,7 +2643,7 @@ async function getMainHTML(env) {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
-  <title>CF优选IP · 双池智能优选 v${VERSION}</title>
+  <title>CF优选IP · 双池智能优选</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body {
@@ -2533,11 +2783,12 @@ async function getMainHTML(env) {
       margin-bottom: 24px;
     }
     .stat-card {
-      background: #0f172a;
+      background: #0b1120;
       padding: 16px;
       border-radius: 14px;
       text-align: center;
       transition: all 0.2s;
+      border: 1px solid #1e293b;
     }
     .stat-card:hover { background: #1e293b; transform: translateY(-2px); }
     .stat-label { font-size: 12px; color: #94a3b8; margin-bottom: 6px; }
@@ -2555,6 +2806,14 @@ async function getMainHTML(env) {
       border-radius: 14px;
       text-align: center;
       border-left: 3px solid #60a5fa;
+      transition: all 0.3s ease;
+      cursor: pointer;
+    }
+    .pool-card:hover {
+      background: #1e293b;
+      transform: translateY(-4px);
+      box-shadow: 0 8px 25px rgba(96, 165, 250, 0.2);
+      border-left: 3px solid #3b82f6;
     }
     .pool-card h4 { font-size: 13px; color: #94a3b8; margin-bottom: 6px; }
     .pool-card .count { font-size: 28px; font-weight: bold; color: #60a5fa; }
@@ -2780,23 +3039,28 @@ async function getMainHTML(env) {
     <div class="card-body" style="padding-top:0;">
       <div class="button-group">
         <button class="btn btn-info" style="flex:1;" onclick="startVisitorAwareSpeedTest()" id="visitorSpeedTestBtn">🚀 为您优选测速</button>
-        <button class="btn btn-primary" style="flex:1;" onclick="updateDNSWithVisitorAware()">🌐 更新DNS（优先您的位置）</button>
+        <button class="btn btn-primary" style="flex:1;" onclick="updateDNSWithVisitorAware()" id="visitorUpdateDNSBtn">🌍 更新DNS（优先您的位置）</button>
       </div>
       <div id="recommendedIPs" style="margin-top: 12px;"></div>
     </div>
   </div>
 
-  <div class="grid">
-    <div>
-      <div class="card">
-        <div class="card-header">
-          <h2>📋 带宽优质池 <span style="font-size:11px; color:#60a5fa;">(评分优先)</span></h2>
-          <div>
-            <button class="btn btn-sm btn-primary" onclick="manualUpdate()">🔄 刷新IP列表</button>
-            <button class="btn btn-sm btn-warning" onclick="startSpeedTest()" id="speedTestBtn">▶ 开始测速</button>
+  <div class="card">
+    <div class="card-header">
+      <h2>🎯 IP池管理与快速操作</h2>
+    </div>
+    <div class="card-body">
+      <div style="display: grid; grid-template-columns: 1.6fr 1fr; gap: 20px; align-items: stretch;">
+        <!-- 左侧：带宽优质池 -->
+        <div style="background: #0f172a; border-radius: 12px; padding: 16px; border: 1px solid #334155;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+            <h3 style="color: #60a5fa; font-size: 14px; margin: 0;">📋 带宽优质池 <span style="font-size:11px; color:#94a3b8;">(评分优先)</span></h3>
+            <div>
+              <button class="btn btn-sm btn-primary" onclick="manualUpdate()">🔄 刷新IP列表</button>
+              <button class="btn btn-sm btn-warning" onclick="startSpeedTest()" id="speedTestBtn">▶ 开始测速</button>
+            </div>
           </div>
-        </div>
-        <div class="card-body">
+          
           <div class="stats-row">
             <div class="stat-card"><div class="stat-label">总IP池</div><div class="stat-value" id="totalCount">0</div></div>
             <div class="stat-card"><div class="stat-label">带宽池</div><div class="stat-value" id="bandwidthCount">0</div></div>
@@ -2813,56 +3077,12 @@ async function getMainHTML(env) {
           
           <div class="progress-bar" id="speedProgress"><div class="progress-bar-fill" id="speedProgressFill"></div></div>
           <div class="speed-status" id="speedStatus"></div>
+        </div>
+        
+        <!-- 右侧：快速操作 -->
+        <div style="background: #0f172a; border-radius: 12px; padding: 16px; border: 1px solid #334155;">
+          <h3 style="color: #60a5fa; font-size: 14px; margin: 0 0 16px 0;">⚡ 快速操作</h3>
           
-          <input type="text" class="search-box" id="search" placeholder="🔍 搜索 IP 地址...">
-        </div>
-      </div>
-
-      <div class="card">
-        <div class="card-header" onclick="toggleIPTable()" style="cursor: pointer;">
-          <h2>📋 优质 IP 列表 <span id="ipTableToggle">▶</span></h2>
-        </div>
-        <div class="card-body" id="ipTableContainer">
-          <div class="table-container" style="max-height: 400px; overflow-y: auto;">
-            <table>
-              <thead>
-                <tr><th>IP 地址</th><th>延迟</th><th>带宽</th><th>评分</th><th>地区</th><th>操作</th></tr>
-              </thead>
-              <tbody id="ipTable2">
-                <tr><td colspan="7" style="text-align:center;padding:40px;">⏳ 暂无优质 IP，请点击"开始测速"或"修复带宽池"</td></tr>
-              </tbody>
-            </table>
-          </div>
-        </div>
-      </div>
-
-      <div class="card">
-        <div class="card-header" onclick="toggleSpeedResults()" style="cursor: pointer;">
-          <h2>📊 实时测速结果 <span id="speedResultToggle">▶</span></h2>
-          <button class="btn btn-sm btn-secondary" onclick="event.stopPropagation(); clearSpeedResults()">清除记录</button>
-        </div>
-        <div class="card-body" id="speedResultContent" style="display:none;">
-          <div class="stats-row" id="speedStatsSummary" style="display:none;">
-            <div class="stat-card"><div class="stat-label">已测试</div><div class="stat-value" id="testedCount">0</div></div>
-            <div class="stat-card"><div class="stat-label">成功</div><div class="stat-value" id="successCount" style="color:#4ade80;">0</div></div>
-            <div class="stat-card"><div class="stat-label">失败</div><div class="stat-value" id="failCount" style="color:#f87171;">0</div></div>
-            <div class="stat-card"><div class="stat-label">平均延迟</div><div class="stat-value" id="avgLatency">--</div></div>
-          </div>
-          <div class="table-container">
-            <table>
-              <thead><tr><th>IP</th><th>延迟</th><th>带宽</th><th>评分</th><th>地区</th><th>时间</th><th>状态</th></tr></thead>
-              <tbody id="speedResultTable"><tr><td colspan="7" style="text-align:center;padding:40px;">暂无测速结果</td></tr></tbody>
-            </table>
-          </div>
-          <div class="info-text">⚡ 延迟测试3次取平均 | 📊 带宽测试下载3-10MB文件(可配置) | 🎯 评分: 带宽80% + 延迟20%</div>
-        </div>
-      </div>
-    </div>
-
-    <div>
-      <div class="card">
-        <div class="card-header"><h2>⚡ 快速操作</h2></div>
-        <div class="card-body">
           <div id="dbStatusCard" style="display:none;"></div>
           
           <div class="button-group">
@@ -2874,40 +3094,141 @@ async function getMainHTML(env) {
             <button class="btn btn-primary" style="flex:1;" onclick="updateDNSWithBest()">🌐 更新 DNS</button>
           </div>
           <div class="button-group">
+            <button class="btn btn-warning" style="flex:1;" onclick="updateDNSForAllCountries()">🌍 更新所有国家DNS</button>
+            <button class="btn btn-info" style="flex:1;" onclick="updateDNSWithSmartRouting()">🧠 智能分流更新</button>
+          </div>
+          <div class="button-group">
             <button class="btn btn-warning" style="flex:1;" onclick="repairBandwidthPool()">🔧 修复带宽池</button>
             <button class="btn btn-info" style="flex:1;" onclick="debugBandwidthPool()">🐛 调试带宽池</button>
           </div>
           <div class="button-group">
             <button class="btn btn-success" style="flex:1;" onclick="exportIPs()">📥 导出优质 IP</button>
+            <button class="btn btn-info" style="flex:1;" onclick="exportBackupIPs()">📥 导出备用池 IP</button>
           </div>
-          
-          <div style="background:#0f172a; border-radius:12px; padding:20px; margin:16px 0;">
-            <h3 style="color:#60a5fa; font-size:14px; margin-bottom:16px;">⚙️ 运行参数</h3>
-            <div class="params-row">
-              <div class="param-item"><label>测速线程数 (1-10)</label><input type="number" class="param-input" id="threadCount" min="1" max="10" value="${uiConfig.threadCount}"></div>
-              <div class="param-item"><label>测速数量 (10-100)</label><input type="number" class="param-input" id="testCount" min="10" max="100" value="${uiConfig.testCount}"></div>
-              <div class="param-item"><label>DNS 自动添加 IP 数量 (1-10)</label><input type="number" class="param-input" id="ipCount" min="1" max="10" value="${uiConfig.ipCount}"></div>
-            </div>
-            <div class="params-row">
-              <div class="param-item"><label>带宽优质池最大容量 (10-50)</label><input type="number" class="param-input" id="maxPoolSize" min="10" max="50" value="${advancedConfig.maxHighQualityPoolSize}"></div>
-              <div class="param-item"><label>失败IP冷却天数 (1-30)</label><input type="number" class="param-input" id="failedCooldown" min="1" max="30" value="${advancedConfig.failedIpCooldownDays}"></div>
-              <div class="param-item"><label>带宽测试文件大小值 (3-10MB)</label><input type="number" class="param-input" id="bandwidthFileSize" min="3" max="10" value="${uiConfig.bandwidthFileSize}"></div>
-            </div>
-            <div style="margin:16px 0; display:flex; align-items:center;">
-              <input type="checkbox" id="clearFailedOnSave" style="margin-right:8px;"> <label style="color:#94a3b8; font-size:13px;">保存时清空失败IP黑名单</label>
-            </div>
-            <button class="btn btn-primary full-width" style="padding:12px;" onclick="saveAllSettings()">💾 保存所有设置</button>
-          </div>
-          
-          <div class="info-text" style="text-align:center;">
-            💡为避免限流，带宽测试每分钟最多10次，测试文件大小3-5MB，数值越大容易触发限流
+          <div class="button-group">
+            <button class="btn btn-danger" style="flex:1;" onclick="clearFailedIPs()">🗑️ 清空失败IP黑名单</button>
           </div>
         </div>
       </div>
-      
-      <div class="card">
-        <div class="card-header"><h2>📝 运行日志</h2><div style="display: flex; gap: 8px;"><button class="btn btn-sm btn-danger" onclick="clearLogs()">清除</button><button class="btn btn-sm btn-primary" onclick="refreshLogs()">刷新</button></div></div>
-        <div class="card-body"><div class="log-panel" id="logPanel"></div></div>
+    </div>
+  </div>
+
+  <div style="display: grid; grid-template-columns: 1.6fr 1fr; gap: 20px; align-items: start;">
+    <!-- 左侧大卡片：实时测速结果 + 区域分析 -->
+    <div class="card">
+      <div class="card-header">
+        <h2>📊 数据分析</h2>
+      </div>
+      <div class="card-body">
+        <!-- 实时测速结果 -->
+        <div style="background: #0f172a; border-radius: 12px; padding: 16px; border: 1px solid #334155; margin-bottom: 20px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; cursor: pointer;" onclick="toggleSpeedResults()">
+            <h3 style="color: #60a5fa; font-size: 14px; margin: 0;">📊 实时测速结果 <span id="speedResultToggle">▶</span></h3>
+            <button class="btn btn-sm btn-secondary" onclick="event.stopPropagation(); clearSpeedResults()">清除记录</button>
+          </div>
+          <div id="speedResultContent" style="display:none;">
+            <div class="stats-row" id="speedStatsSummary" style="display:none;">
+              <div class="stat-card"><div class="stat-label">已测试</div><div class="stat-value" id="testedCount">0</div></div>
+              <div class="stat-card"><div class="stat-label">成功</div><div class="stat-value" id="successCount" style="color:#4ade80;">0</div></div>
+              <div class="stat-card"><div class="stat-label">失败</div><div class="stat-value" id="failCount" style="color:#f87171;">0</div></div>
+              <div class="stat-card"><div class="stat-label">平均延迟</div><div class="stat-value" id="avgLatency">--</div></div>
+            </div>
+            <div class="table-container">
+              <table>
+                <thead><tr><th>IP</th><th>延迟</th><th>带宽</th><th>评分</th><th>地区</th><th>时间</th><th>状态</th></tr></thead>
+                <tbody id="speedResultTable"><tr><td colspan="7" style="text-align:center;padding:40px;">暂无测速结果</td></tr></tbody>
+              </table>
+            </div>
+            <div class="info-text">⚡ 延迟测试3次取平均 | 📊 带宽测试下载3-10MB文件(可配置) | 🎯 评分: 带宽80% + 延迟20%</div>
+          </div>
+        </div>
+        
+        <!-- 区域分析 -->
+        <div style="background: #0f172a; border-radius: 12px; padding: 16px; border: 1px solid #334155;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; cursor: pointer;" onclick="toggleRegionStats()">
+            <h3 style="color: #60a5fa; font-size: 14px; margin: 0;">🌍 区域分析 <span id="regionStatsToggle">▶</span></h3>
+            <button class="btn btn-sm btn-primary" onclick="event.stopPropagation(); loadRegionStats()">刷新数据</button>
+          </div>
+          <div id="regionStatsContent" style="display:none;">
+            <div class="stats-row" id="regionStatsSummary" style="display:none;">
+              <div class="stat-card"><div class="stat-label">全球平均延迟</div><div class="stat-value" id="globalAvgLatency">--</div></div>
+              <div class="stat-card"><div class="stat-label">全球平均带宽</div><div class="stat-value" id="globalAvgBandwidth">--</div></div>
+              <div class="stat-card"><div class="stat-label">总地区数</div><div class="stat-value" id="totalRegions">--</div></div>
+              <div class="stat-card"><div class="stat-label">总IP数</div><div class="stat-value" id="totalRegionIPs">--</div></div>
+            </div>
+            <div class="table-container">
+              <table>
+                <thead><tr><th>地区</th><th>IP数量</th><th>平均延迟</th><th>平均带宽</th><th>最佳延迟</th><th>最差延迟</th><th>更新时间</th></tr></thead>
+                <tbody id="regionStatsTable"><tr><td colspan="7" style="text-align:center;padding:40px;">暂无区域数据</td></tr></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    
+    <!-- 右侧大卡片：运行参数 + 运行日志 -->
+    <div class="card">
+      <div class="card-header">
+        <h2>⚙️ 配置与日志</h2>
+      </div>
+      <div class="card-body">
+        <!-- 运行参数 -->
+        <div style="background: #0f172a; border-radius: 12px; padding: 16px; border: 1px solid #334155; margin-bottom: 20px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; cursor: pointer;" onclick="toggleParamsCard()">
+            <h3 style="color: #60a5fa; font-size: 14px; margin: 0;">⚙️ 运行参数</h3>
+            <span id="paramsToggleIcon" style="font-size:18px; color:#94a3b8;">▼</span>
+          </div>
+          <div id="paramsCardBody" style="display:none;">
+            <div style="margin-bottom:12px;">
+              <h4 style="color:#60a5fa; font-size:12px; margin:0 0 8px 0; font-weight:500;">📊 测速设置</h4>
+              <div class="params-row">
+                <div class="param-item"><label style="font-size:11px;">测速线程数 (1-10)</label><input type="number" class="param-input" id="threadCount" min="1" max="10" value="${uiConfig.threadCount}"></div>
+                <div class="param-item"><label style="font-size:11px;">测速数量 (10-100)</label><input type="number" class="param-input" id="testCount" min="10" max="100" value="${uiConfig.testCount}"></div>
+                <div class="param-item"><label style="font-size:11px;">带宽测试文件 (3-10MB)</label><input type="number" class="param-input" id="bandwidthFileSize" min="3" max="10" value="${uiConfig.bandwidthFileSize}"></div>
+              </div>
+            </div>
+            
+            <div style="margin-bottom:12px;">
+              <h4 style="color:#60a5fa; font-size:12px; margin:0 0 8px 0; font-weight:500;">🌐 DNS 设置</h4>
+              <div class="params-row">
+                <div class="param-item"><label style="font-size:11px;">DNS 自动添加 IP 数量 (1-10)</label><input type="number" class="param-input" id="ipCount" min="1" max="10" value="${uiConfig.ipCount}"></div>
+                <div class="param-item"><label style="font-size:11px;">失败IP冷却天数 (1-30)</label><input type="number" class="param-input" id="failedCooldown" min="1" max="30" value="${advancedConfig.failedIpCooldownDays}"></div>
+                <div class="param-item"></div>
+              </div>
+            </div>
+            
+            <div style="margin-bottom:12px;">
+              <h4 style="color:#60a5fa; font-size:12px; margin:0 0 8px 0; font-weight:500;">💾 池容量设置</h4>
+              <div class="params-row">
+                <div class="param-item"><label style="font-size:11px;">带宽优质池最大容量 (10-50)</label><input type="number" class="param-input" id="maxPoolSize" min="10" max="50" value="${advancedConfig.maxHighQualityPoolSize}"></div>
+                <div class="param-item"><label style="font-size:11px;">备用池最大容量 (50-500)</label><input type="number" class="param-input" id="maxBackupPoolSize" min="50" max="500" value="${advancedConfig.maxBackupPoolSize}"></div>
+                <div class="param-item"></div>
+              </div>
+            </div>
+            
+            <button class="btn btn-primary full-width" style="padding:10px; margin-top:8px;" onclick="saveAllSettings()">💾 保存所有设置</button>
+            
+            <div class="info-text" style="text-align:center; margin-top:10px; font-size:11px;">
+              💡为避免限流，带宽测试每分钟最多10次，测试文件大小3-5MB，数值越大容易触发限流
+            </div>
+          </div>
+        </div>
+        
+        <!-- 运行日志 -->
+        <div style="background: #0f172a; border-radius: 12px; padding: 16px; border: 1px solid #334155;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; cursor: pointer;" onclick="toggleLogsCard()">
+            <h3 style="color: #60a5fa; font-size: 14px; margin: 0;">📝 运行日志</h3>
+            <div style="display: flex; gap: 8px; align-items: center; height: 32px;">
+              <button class="btn btn-sm btn-danger" style="height: 28px; line-height: 1;" onclick="event.stopPropagation(); clearLogs();">清除</button>
+              <button class="btn btn-sm btn-primary" style="height: 28px; line-height: 1;" onclick="event.stopPropagation(); refreshLogs();">刷新</button>
+              <span id="logsToggleIcon" style="font-size:18px; color:#94a3b8; line-height: 1;">▼</span>
+            </div>
+          </div>
+          <div id="logsCardBody" style="display:none;">
+            <div class="log-panel" id="logPanel"></div>
+          </div>
+        </div>
       </div>
     </div>
   </div>
@@ -3085,6 +3406,52 @@ async function getMainHTML(env) {
   function calculateScore(l,b) { let ls=0; if(l<=50) ls=100; else if(l<=100) ls=90; else if(l<=150) ls=80; else if(l<=200) ls=70; else if(l<=250) ls=60; else ls=50; let bs=0; if(!b||b===0) bs=0; else if(b>=1000) bs=100; else if(b>=500) bs=95; else if(b>=300) bs=90; else if(b>=200) bs=85; else if(b>=100) bs=80; else if(b>=50) bs=60; else if(b>=20) bs=40; else bs=20; return Math.round(bs*0.8+ls*0.2); }
   function getScoreClass(s) { if(s>=80) return 'score-high'; if(s>=60) return 'score-medium'; return 'score-low'; }
   
+  function toggleRegionStats() {
+    const content = document.getElementById('regionStatsContent');
+    const toggle = document.getElementById('regionStatsToggle');
+    if (content.style.display === 'none') {
+      content.style.display = 'block';
+      toggle.textContent = '▼';
+      loadRegionStats();
+    } else {
+      content.style.display = 'none';
+      toggle.textContent = '▶';
+    }
+  }
+
+  async function loadRegionStats() {
+    try {
+      const res = await fetch('/api/region-quality');
+      const data = await res.json();
+      console.log('Region quality data:', data);
+      
+      if (data.success) {
+        const regions = data.regions || [];
+        const stats = data.summary || {};
+        
+        // Update summary
+        document.getElementById('globalAvgLatency').textContent = stats.global_avg_latency ? parseFloat(stats.global_avg_latency).toFixed(1) + 'ms' : '--';
+        document.getElementById('globalAvgBandwidth').textContent = stats.global_avg_bandwidth ? parseFloat(stats.global_avg_bandwidth).toFixed(1) + 'Mbps' : '--';
+        document.getElementById('totalRegions').textContent = stats.total_regions || 0;
+        document.getElementById('totalRegionIPs').textContent = stats.total_ips || 0;
+        document.getElementById('regionStatsSummary').style.display = 'grid';
+        
+        // Update table
+        const tableBody = document.getElementById('regionStatsTable');
+        if (regions.length > 0) {
+          tableBody.innerHTML = regions.map(r => '<tr><td><span class="country-badge">' + (r.countryName || r.country) + '</span></td><td>' + r.ipCount + '</td><td><span class="latency-badge ' + getLatencyClass(r.avgLatency) + '">' + Math.round(r.avgLatency) + 'ms</span></td><td>' + (r.avgBandwidth ? parseFloat(r.avgBandwidth).toFixed(1) + 'Mbps' : '0Mbps') + '</td><td>' + (r.minLatency || '--') + 'ms</td><td>' + (r.maxLatency || '--') + 'ms</td><td>' + (r.lastUpdated || '--') + '</td></tr>').join('');
+        } else {
+          tableBody.innerHTML = '<tr><td colspan="7" style="text-align:center;padding:40px;">暂无区域数据，请先进行测速或更新IP列表</td></tr>';
+        }
+      } else {
+        showToast('获取区域数据失败: ' + (data.error || '未知错误'), 'error');
+      }
+    } catch (error) {
+      console.error('加载区域数据失败:', error);
+      showToast('加载区域数据失败: ' + error.message, 'error');
+    }
+  }
+
   function setTestMode(mode) {
     testMode = mode;
     document.getElementById('modeFull').classList.toggle('active', mode === 'full');
@@ -3099,30 +3466,6 @@ async function getMainHTML(env) {
       toggle.textContent = '▼';
     } else {
       content.style.display = 'none';
-      toggle.textContent = '▶';
-    }
-  }
-  
-  function toggleIPTable() {
-    const container = document.getElementById('ipTableContainer');
-    const toggle = document.getElementById('ipTableToggle');
-    if (container.style.display === 'none') {
-      container.style.display = 'block';
-      toggle.textContent = '▼';
-    } else {
-      container.style.display = 'none';
-      toggle.textContent = '▶';
-    }
-    localStorage.setItem('ipTableCollapsed', container.style.display === 'none' ? 'true' : 'false');
-  }
-  
-  // 恢复 IP 列表折叠状态
-  function restoreIPTableState() {
-    const collapsed = localStorage.getItem('ipTableCollapsed');
-    if (collapsed === 'true') {
-      const container = document.getElementById('ipTableContainer');
-      const toggle = document.getElementById('ipTableToggle');
-      container.style.display = 'none';
       toggle.textContent = '▶';
     }
   }
@@ -3192,25 +3535,318 @@ async function getMainHTML(env) {
   
   async function loadPoolStats() {
     try {
+      // 获取带宽池统计
       const bwRes = await fetch('/api/get-pool-stats?type=bandwidth');
       const bwData = await bwRes.json();
+      
+      // 获取备用池统计
+      const backupRes = await fetch('/api/get-pool-stats?type=backup');
+      const backupData = await backupRes.json();
+      
       if (bwData.success) {
         document.getElementById('bandwidthCount').innerText = bwData.currentCount;
-        // 获取备用池统计
-        const backupRes = await fetch('/api/get-pool-stats?type=backup');
-        const backupData = await backupRes.json();
-        if (backupData.success) {
-          document.getElementById('backupCount').innerText = backupData.currentCount;
-        }
-        
+      }
+      
+      if (backupData.success) {
+        document.getElementById('backupCount').innerText = backupData.currentCount;
+      }
+      
+      // 更新池统计卡片显示
+      if (bwData.success || backupData.success) {
         document.getElementById('poolStats').innerHTML = \`
-          <div class="pool-card"><h4>🚀 带宽优质池</h4><div class="count">\${bwData.currentCount}/\${bwData.maxPoolSize}</div><div class="sub">平均延迟: \${bwData.stats.avgLatency}ms | 平均带宽: \${bwData.stats.avgBandwidth} Mbps</div></div>
-          <div class="pool-card"><h4>📋 备用池</h4><div class="count">\${backupData.success ? backupData.currentCount : 0}/50</div><div class="sub">平均延迟: \${backupData.success ? backupData.stats.avgLatency : 0}ms | 平均带宽: \${backupData.success ? backupData.stats.avgBandwidth : 0} Mbps</div></div>
+          <div class="pool-card" onclick="showBandwidthPoolModal()" style="cursor: pointer;" title="点击查看带宽优质池IP列表"><h4>🚀 带宽优质池</h4><div class="count">\${bwData.success ? bwData.currentCount : 0}/\${bwData.success ? bwData.maxPoolSize : 30}</div><div class="sub">平均延迟: \${bwData.success ? bwData.stats.avgLatency : 0}ms | 平均带宽: \${bwData.success ? bwData.stats.avgBandwidth : 0} Mbps</div></div>
+          <div class="pool-card" onclick="showBackupPoolModal()" style="cursor: pointer;" title="点击查看备用池IP列表"><h4>📋 备用池</h4><div class="count">\${backupData.success ? backupData.currentCount : 0}/\${backupData.success ? backupData.maxPoolSize : 50}</div><div class="sub">平均延迟: \${backupData.success ? backupData.stats.avgLatency : 0}ms | 平均带宽: \${backupData.success ? backupData.stats.avgBandwidth : 0} Mbps</div></div>
         \`;
       }
-    } catch(e) {}
+    } catch(e) { console.error('loadPoolStats error:', e); }
   }
-  
+
+  // 备用池弹窗相关变量
+  let backupPoolIPs = [];
+  let backupPoolCountries = [];
+
+  async function showBackupPoolModal() {
+    const modal = document.createElement('div');
+    modal.id = 'backupPoolModal';
+    modal.style.cssText = 'position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.8); z-index: 1000; display: flex; align-items: center; justify-content: center;';
+    modal.innerHTML = \`
+      <div style="background: #1e293b; border-radius: 12px; width: 90%; max-width: 1000px; max-height: 80vh; overflow: hidden; display: flex; flex-direction: column;">
+        <div style="padding: 20px; border-bottom: 1px solid #334155; display: flex; justify-content: space-between; align-items: center;">
+          <h2 style="margin: 0; color: #e2e8f0;">📋 备用池 IP 列表</h2>
+          <button onclick="closeBackupPoolModal()" style="background: none; border: none; color: #94a3b8; font-size: 24px; cursor: pointer;">×</button>
+        </div>
+        <div style="padding: 20px; overflow-y: auto; flex: 1;">
+          <!-- 筛选区域 -->
+          <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-bottom: 20px; padding: 16px; background: #0f172a; border-radius: 8px;">
+            <div>
+              <label style="color: #94a3b8; font-size: 12px;">国家/地区</label>
+              <select id="backupFilterCountry" onchange="loadBackupPoolIPs()" style="width: 100%; padding: 8px; background: #1e293b; border: 1px solid #334155; border-radius: 6px; color: #e2e8f0;">
+                <option value="all">全部</option>
+              </select>
+            </div>
+            <div>
+              <label style="color: #94a3b8; font-size: 12px;">最小带宽 (Mbps)</label>
+              <input type="number" id="backupFilterMinBandwidth" value="0" min="0" onchange="loadBackupPoolIPs()" style="width: 100%; padding: 8px; background: #1e293b; border: 1px solid #334155; border-radius: 6px; color: #e2e8f0;">
+            </div>
+            <div>
+              <label style="color: #94a3b8; font-size: 12px;">最大延迟 (ms)</label>
+              <input type="number" id="backupFilterMaxLatency" value="9999" min="0" onchange="loadBackupPoolIPs()" style="width: 100%; padding: 8px; background: #1e293b; border: 1px solid #334155; border-radius: 6px; color: #e2e8f0;">
+            </div>
+            <div>
+              <label style="color: #94a3b8; font-size: 12px;">排序方式</label>
+              <select id="backupFilterSortBy" onchange="loadBackupPoolIPs()" style="width: 100%; padding: 8px; background: #1e293b; border: 1px solid #334155; border-radius: 6px; color: #e2e8f0;">
+                <option value="bandwidth">带宽优先</option>
+                <option value="latency">延迟优先</option>
+                <option value="country">国家优先</option>
+              </select>
+            </div>
+          </div>
+          
+          <!-- 统计信息 -->
+          <div style="margin-bottom: 16px; color: #94a3b8; font-size: 14px;">
+            共找到 <span id="backupPoolTotal" style="color: #60a5fa; font-weight: bold;">0</span> 个 IP
+          </div>
+          
+          <!-- IP 列表表格 -->
+          <div style="overflow-x: auto;">
+            <table style="width: 100%; border-collapse: collapse;">
+              <thead>
+                <tr style="border-bottom: 2px solid #334155;">
+                  <th style="text-align: left; padding: 12px; color: #94a3b8;">IP 地址</th>
+                  <th style="text-align: left; padding: 12px; color: #94a3b8;">延迟</th>
+                  <th style="text-align: left; padding: 12px; color: #94a3b8;">带宽</th>
+                  <th style="text-align: left; padding: 12px; color: #94a3b8;">国家/地区</th>
+                  <th style="text-align: left; padding: 12px; color: #94a3b8;">城市</th>
+                  <th style="text-align: left; padding: 12px; color: #94a3b8;">最后测试</th>
+                </tr>
+              </thead>
+              <tbody id="backupPoolTableBody">
+                <tr><td colspan="6" style="text-align: center; padding: 40px; color: #64748b;">加载中...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    \`;
+    document.body.appendChild(modal);
+    await loadBackupPoolIPs();
+  }
+
+  function closeBackupPoolModal() {
+    const modal = document.getElementById('backupPoolModal');
+    if (modal) modal.remove();
+  }
+
+  async function loadBackupPoolIPs() {
+    try {
+      const country = document.getElementById('backupFilterCountry')?.value || 'all';
+      const minBandwidth = document.getElementById('backupFilterMinBandwidth')?.value || 0;
+      const maxLatency = document.getElementById('backupFilterMaxLatency')?.value || 9999;
+      const sortBy = document.getElementById('backupFilterSortBy')?.value || 'bandwidth';
+      
+      const url = \`/api/backup-pool-ips?country=\${country}&minBandwidth=\${minBandwidth}&maxLatency=\${maxLatency}&sortBy=\${sortBy}&limit=200\`;
+      const res = await fetch(url);
+      const data = await res.json();
+      
+      if (data.success) {
+        backupPoolIPs = data.ips;
+        backupPoolCountries = data.countries;
+        
+        // 更新国家筛选下拉框
+        const countrySelect = document.getElementById('backupFilterCountry');
+        if (countrySelect && countrySelect.options.length <= 1) {
+          backupPoolCountries.forEach(c => {
+            const option = document.createElement('option');
+            option.value = c;
+            option.textContent = window.countryNames?.[c] || c;
+            countrySelect.appendChild(option);
+          });
+        }
+        
+        // 更新统计
+        document.getElementById('backupPoolTotal').textContent = data.total;
+        
+        // 更新表格
+        const tbody = document.getElementById('backupPoolTableBody');
+        if (backupPoolIPs.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; padding: 40px; color: #64748b;">暂无数据</td></tr>';
+        } else {
+          tbody.innerHTML = backupPoolIPs.map(ip => {
+            const countryName = window.countryNames?.[ip.country] || ip.country || '未知';
+            const latencyClass = ip.latency <= 50 ? 'color: #10b981;' : ip.latency <= 100 ? 'color: #f59e0b;' : 'color: #ef4444;';
+            const bandwidthClass = ip.bandwidth >= 500 ? 'color: #10b981; font-weight: bold;' : ip.bandwidth >= 200 ? 'color: #60a5fa;' : 'color: #e2e8f0;';
+            // 处理 last_tested 时间，确保正确转换为上海时区
+            let lastTested = '-';
+            if (ip.last_tested) {
+              try {
+                const date = new Date(ip.last_tested);
+                console.log('Processing date:', ip.last_tested, '->', date, 'valid:', !isNaN(date.getTime()));
+                if (!isNaN(date.getTime())) {
+                  // 手动添加 8 小时来转换为上海时区
+                  const shanghaiDate = new Date(date.getTime() + 8 * 60 * 60 * 1000);
+                  lastTested = shanghaiDate.toLocaleString('zh-CN', { hour12: false });
+                  console.log('Converted to:', lastTested);
+                }
+              } catch (e) {
+                console.error('Date parse error:', ip.last_tested, e);
+              }
+            }
+            return \`
+              <tr style="border-bottom: 1px solid #334155;">
+                <td style="padding: 12px; color: #e2e8f0; font-family: monospace;">\${ip.ip}</td>
+                <td style="padding: 12px; \${latencyClass}">\${ip.latency}ms</td>
+                <td style="padding: 12px; \${bandwidthClass}">\${ip.bandwidth || 0} Mbps</td>
+                <td style="padding: 12px; color: #e2e8f0;">\${countryName}</td>
+                <td style="padding: 12px; color: #94a3b8;">\${ip.city || '-'}</td>
+                <td style="padding: 12px; color: #94a3b8; font-size: 12px;">\${lastTested}</td>
+              </tr>
+            \`;
+          }).join('');
+        }
+      }
+    } catch (error) {
+      document.getElementById('backupPoolTableBody').innerHTML = '<tr><td colspan="6" style="text-align: center; padding: 40px; color: #ef4444;">加载失败: ' + error.message + '</td></tr>';
+    }
+  }
+
+  // 带宽优质池弹窗功能
+  let bandwidthPoolCountries = [];
+
+  async function showBandwidthPoolModal() {
+    const modal = document.createElement('div');
+    modal.id = 'bandwidthPoolModal';
+    modal.style.cssText = 'position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.8); z-index: 1000; display: flex; align-items: center; justify-content: center;';
+    modal.innerHTML = '<div style="background: #1e293b; border-radius: 12px; width: 90%; max-width: 1000px; max-height: 80vh; overflow: hidden; display: flex; flex-direction: column;">' +
+      '<div style="padding: 20px; border-bottom: 1px solid #334155; display: flex; justify-content: space-between; align-items: center;">' +
+        '<h2 style="margin: 0; color: #e2e8f0;">🚀 带宽优质池 IP 列表</h2>' +
+        '<button onclick="closeBandwidthPoolModal()" style="background: none; border: none; color: #94a3b8; font-size: 24px; cursor: pointer;">×</button>' +
+      '</div>' +
+      '<div style="padding: 20px; overflow-y: auto; flex: 1;">' +
+        '<div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-bottom: 20px; padding: 16px; background: #0f172a; border-radius: 8px;">' +
+          '<div>' +
+            '<label style="color: #94a3b8; font-size: 12px;">国家/地区</label>' +
+            '<select id="bandwidthFilterCountry" onchange="loadBandwidthPoolIPs()" style="width: 100%; padding: 8px; background: #1e293b; border: 1px solid #334155; border-radius: 6px; color: #e2e8f0;">' +
+              '<option value="all">全部</option>' +
+            '</select>' +
+          '</div>' +
+          '<div>' +
+            '<label style="color: #94a3b8; font-size: 12px;">最小带宽 (Mbps)</label>' +
+            '<input type="number" id="bandwidthFilterMinBandwidth" value="0" min="0" onchange="loadBandwidthPoolIPs()" style="width: 100%; padding: 8px; background: #1e293b; border: 1px solid #334155; border-radius: 6px; color: #e2e8f0;">' +
+          '</div>' +
+          '<div>' +
+            '<label style="color: #94a3b8; font-size: 12px;">最大延迟 (ms)</label>' +
+            '<input type="number" id="bandwidthFilterMaxLatency" value="9999" min="0" onchange="loadBandwidthPoolIPs()" style="width: 100%; padding: 8px; background: #1e293b; border: 1px solid #334155; border-radius: 6px; color: #e2e8f0;">' +
+          '</div>' +
+          '<div>' +
+            '<label style="color: #94a3b8; font-size: 12px;">排序方式</label>' +
+            '<select id="bandwidthFilterSortBy" onchange="loadBandwidthPoolIPs()" style="width: 100%; padding: 8px; background: #1e293b; border: 1px solid #334155; border-radius: 6px; color: #e2e8f0;">' +
+              '<option value="bandwidth">带宽优先</option>' +
+              '<option value="latency">延迟优先</option>' +
+              '<option value="country">国家优先</option>' +
+            '</select>' +
+          '</div>' +
+        '</div>' +
+        '<div style="margin-bottom: 16px; color: #94a3b8; font-size: 14px;">' +
+          '共找到 <span id="bandwidthPoolTotal" style="color: #60a5fa; font-weight: bold;">0</span> 个 IP' +
+        '</div>' +
+        '<div style="overflow-x: auto;">' +
+          '<table style="width: 100%; border-collapse: collapse;">' +
+            '<thead>' +
+              '<tr style="border-bottom: 2px solid #334155;">' +
+                '<th style="text-align: left; padding: 12px; color: #94a3b8;">IP 地址</th>' +
+                '<th style="text-align: left; padding: 12px; color: #94a3b8;">延迟</th>' +
+                '<th style="text-align: left; padding: 12px; color: #94a3b8;">带宽</th>' +
+                '<th style="text-align: left; padding: 12px; color: #94a3b8;">国家/地区</th>' +
+                '<th style="text-align: left; padding: 12px; color: #94a3b8;">城市</th>' +
+                '<th style="text-align: left; padding: 12px; color: #94a3b8;">最后测试</th>' +
+              '</tr>' +
+            '</thead>' +
+            '<tbody id="bandwidthPoolTableBody">' +
+              '<tr><td colspan="6" style="text-align: center; padding: 40px; color: #64748b;">加载中...</td></tr>' +
+            '</tbody>' +
+          '</table>' +
+        '</div>' +
+      '</div>' +
+    '</div>';
+    document.body.appendChild(modal);
+    await loadBandwidthPoolIPs();
+  }
+
+  function closeBandwidthPoolModal() {
+    const modal = document.getElementById('bandwidthPoolModal');
+    if (modal) modal.remove();
+  }
+
+  async function loadBandwidthPoolIPs() {
+    try {
+      const country = document.getElementById('bandwidthFilterCountry')?.value || 'all';
+      const minBandwidth = document.getElementById('bandwidthFilterMinBandwidth')?.value || 0;
+      const maxLatency = document.getElementById('bandwidthFilterMaxLatency')?.value || 9999;
+      const sortBy = document.getElementById('bandwidthFilterSortBy')?.value || 'bandwidth';
+      
+      const url = '/api/bandwidth-pool-ips?country=' + country + '&minBandwidth=' + minBandwidth + '&maxLatency=' + maxLatency + '&sortBy=' + sortBy + '&limit=200';
+      const res = await fetch(url);
+      const data = await res.json();
+      
+      // 调试：打印第一个 IP 的时间数据
+      if (data.success && data.ips && data.ips.length > 0) {
+        console.log('First IP last_tested:', data.ips[0].last_tested);
+      }
+      
+      if (data.success) {
+        bandwidthPoolIPs = data.ips;
+        bandwidthPoolCountries = data.countries;
+        
+        const countrySelect = document.getElementById('bandwidthFilterCountry');
+        if (countrySelect && countrySelect.options.length <= 1) {
+          bandwidthPoolCountries.forEach(function(c) {
+            const option = document.createElement('option');
+            option.value = c;
+            option.textContent = window.countryNames?.[c] || c;
+            countrySelect.appendChild(option);
+          });
+        }
+        
+        document.getElementById('bandwidthPoolTotal').textContent = data.total;
+        
+        const tbody = document.getElementById('bandwidthPoolTableBody');
+        if (bandwidthPoolIPs.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; padding: 40px; color: #64748b;">暂无数据</td></tr>';
+        } else {
+          tbody.innerHTML = bandwidthPoolIPs.map(function(ip) {
+            const countryName = window.countryNames?.[ip.country] || ip.country || '未知';
+            const latencyClass = ip.latency <= 50 ? 'color: #10b981;' : ip.latency <= 100 ? 'color: #f59e0b;' : 'color: #ef4444;';
+            const bandwidthClass = ip.bandwidth >= 500 ? 'color: #10b981; font-weight: bold;' : ip.bandwidth >= 200 ? 'color: #60a5fa;' : 'color: #e2e8f0;';
+            // 处理 last_tested 时间，确保正确转换为上海时区
+            let lastTested = '-';
+            if (ip.last_tested) {
+              try {
+                const date = new Date(ip.last_tested);
+                if (!isNaN(date.getTime())) {
+                  // 手动添加 8 小时来转换为上海时区 (UTC+8)
+                  const shanghaiDate = new Date(date.getTime() + 8 * 60 * 60 * 1000);
+                  lastTested = shanghaiDate.toLocaleString('zh-CN', { hour12: false });
+                }
+              } catch (e) {
+                console.error('Bandwidth - Date parse error:', ip.last_tested, e);
+              }
+            }
+            return '<tr style="border-bottom: 1px solid #334155;">' +
+              '<td style="padding: 12px; color: #e2e8f0; font-family: monospace;">' + ip.ip + '</td>' +
+              '<td style="padding: 12px; ' + latencyClass + '">' + ip.latency + 'ms</td>' +
+              '<td style="padding: 12px; ' + bandwidthClass + '">' + (ip.bandwidth || 0) + ' Mbps</td>' +
+              '<td style="padding: 12px; color: #e2e8f0;">' + countryName + '</td>' +
+              '<td style="padding: 12px; color: #94a3b8;">' + (ip.city || '-') + '</td>' +
+              '<td style="padding: 12px; color: #94a3b8; font-size: 12px;">' + lastTested + '</td>' +
+            '</tr>';
+          }).join('');
+        }
+      }
+    } catch (error) {
+      document.getElementById('bandwidthPoolTableBody').innerHTML = '<tr><td colspan="6" style="text-align: center; padding: 40px; color: #ef4444;">加载失败: ' + error.message + '</td></tr>';
+    }
+  }
+
   async function loadVisitorInfo() {
     try {
       const res = await fetch('/api/visitor-info');
@@ -3286,7 +3922,7 @@ async function getMainHTML(env) {
       btn.textContent = '🌐 更新DNS（优先您的位置）';
     }
   }
-  
+
   async function startSmartSpeedTest() {
     showConfirm('智能测速将根据双池状态自动调整，可能需要几分钟。确定吗？', async () => {
       const btn = event.target;
@@ -3366,31 +4002,41 @@ async function getMainHTML(env) {
       allIPs = data.allIPs || [];
       document.getElementById('totalCount').innerText = data.totalCount || 0;
       document.getElementById('failedCount').innerText = data.failedCount || 0;
-      renderTable();
     } catch(e) {}
-  }
-  
-  function renderTable() {
-    const search = document.getElementById('search').value.toLowerCase();
-    let ips = [...bandwidthPoolIPs].filter(item => item.ip.toLowerCase().includes(search));
-    if (ips.length) {
-      const html = ips.map(item => {
-        const cn = window.countryNames?.[item.country] || item.country || '未知';
-        const lc = getLatencyClass(item.latency);
-        const score = calculateScore(item.latency, item.bandwidth);
-        const scoreClass = getScoreClass(score);
-        return \`<tr><td class="ip-cell">\${item.ip}</td><td><span class="latency-badge \${lc}">\${item.latency}ms</span></td><td>\${item.bandwidth ? item.bandwidth + ' Mbps' : '未测'}</td><td><span class="score-badge \${scoreClass}">\${score}分</span></td><td><span class="country-badge">\${cn}</span></td><td><button class="btn btn-sm btn-secondary" onclick="copyIP('\${item.ip}')">复制</button></td></tr>\`;
-      }).join('');
-      document.getElementById('ipTable2').innerHTML = html;
-    } else {
-      document.getElementById('ipTable2').innerHTML = '<tr><td colspan="6" style="text-align:center;padding:40px;">⏳ 暂无优质 IP，请点击"开始测速"或"修复带宽池"</td></tr>';
-    }
   }
   
   function copyIP(ip) { navigator.clipboard.writeText(ip); showToast('IP 已复制', 'success'); }
   
+  function toggleParamsCard() {
+    const body = document.getElementById('paramsCardBody');
+    const icon = document.getElementById('paramsToggleIcon');
+    if (body.style.display === 'none') {
+      body.style.display = 'block';
+      icon.textContent = '▲';
+    } else {
+      body.style.display = 'none';
+      icon.textContent = '▼';
+    }
+  }
+  
+  function toggleLogsCard() {
+    const body = document.getElementById('logsCardBody');
+    const icon = document.getElementById('logsToggleIcon');
+    if (body.style.display === 'none') {
+      body.style.display = 'block';
+      icon.textContent = '▲';
+    } else {
+      body.style.display = 'none';
+      icon.textContent = '▼';
+    }
+  }
+  
   function exportIPs() {
     window.location.href = '/api/export-ips';
+  }
+  
+  function exportBackupIPs() {
+    window.location.href = '/api/export-backup-ips';
   }
   
   async function manualUpdate() {
@@ -3420,13 +4066,53 @@ async function getMainHTML(env) {
     }
   }
   
+  async function updateDNSForAllCountries() {
+    const btn = event.target;
+    btn.disabled = true;
+    btn.textContent = '更新中...';
+    try {
+      const res = await fetch('/api/update-dns-all-countries', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}) });
+      const data = await res.json();
+      if (data.success) {
+        showToast('所有国家DNS更新成功！成功 ' + data.successCount + '/' + data.totalCount + ' 个国家', 'success');
+      } else {
+        showToast('DNS更新失败：' + (data.error || '请检查国家域名配置'), 'error');
+      }
+    } catch(e) {
+      showToast('更新失败：' + e.message, 'error');
+    } finally {
+      btn.disabled = false;
+      btn.textContent = '🌍 更新所有国家DNS';
+    }
+  }
+  
+  async function updateDNSWithSmartRouting() {
+    const btn = event.target;
+    btn.disabled = true;
+    btn.textContent = '更新中...';
+    try {
+      const res = await fetch('/api/update-dns-smart-routing', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}) });
+      const data = await res.json();
+      if (data.success) {
+        showToast('智能分流DNS更新成功！共更新 ' + (data.updatedCountries?.length || 0) + ' 个国家', 'success');
+      } else {
+        showToast('DNS更新失败：' + (data.error || '请检查配置'), 'error');
+      }
+    } catch(e) {
+      showToast('更新失败：' + e.message, 'error');
+    } finally {
+      btn.disabled = false;
+      btn.textContent = '🧠 智能分流更新';
+    }
+  }
+  
   function addSpeedResult(ip, result) {
     const score = result.success ? calculateScore(result.latency, result.bandwidth) : 0;
     speedTestResults.unshift({
       id: Date.now() + Math.random(), ip, latency: result.latency || null, bandwidth: result.bandwidth || null,
       success: result.success, score, country: result.country || 'unknown',
       countryName: window.countryNames?.[result.country] || result.country || '未知',
-      timeStr: new Date().toLocaleTimeString('zh-CN')
+      timeStr: new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false })
     });
     if (speedTestResults.length > 100) speedTestResults = speedTestResults.slice(0, 100);
     updateSpeedResultDisplay();
@@ -3528,7 +4214,7 @@ async function getMainHTML(env) {
       if (!allIPs.length) showToast('没有可测速的IP，请先点击"刷新IP列表"', 'warning');
       return;
     }
-    const testCount = parseInt(document.getElementById('testCount').value) || 50;
+    const testCount = parseInt(document.getElementById('testCount').value) || 30;
     const threadCount = parseInt(document.getElementById('threadCount').value) || 10;
     const shuffled = [...allIPs].sort(() => 0.5 - Math.random());
     const queue = shuffled.slice(0, Math.min(testCount, allIPs.length));
@@ -3551,30 +4237,51 @@ async function getMainHTML(env) {
   
   function escapeHtml(text) { const div = document.createElement('div'); div.textContent = text; return div.innerHTML; }
   
+  async function clearFailedIPs() {
+    const btn = event.target;
+    btn.disabled = true;
+    btn.textContent = '清空中...';
+    try {
+      const res = await fetch('/api/clear-failed-ips', { method: 'POST' });
+      const data = await res.json();
+      if (data.success) {
+        showToast('失败IP黑名单已清空', 'success');
+      } else {
+        showToast('清空失败：' + (data.error || '未知错误'), 'error');
+      }
+    } catch(e) {
+      showToast('清空失败：' + e.message, 'error');
+    } finally {
+      btn.disabled = false;
+      btn.textContent = '🗑️ 清空失败IP黑名单';
+    }
+  }
+  
   async function saveAdvancedSettings() {
     const maxPoolSizeElement = document.getElementById('maxPoolSize');
     const failedCooldownElement = document.getElementById('failedCooldown');
-    const clearFailedElement = document.getElementById('clearFailedOnSave');
+    const maxBackupPoolSizeElement = document.getElementById('maxBackupPoolSize');
     
-    if (!maxPoolSizeElement || !failedCooldownElement || !clearFailedElement) {
+    if (!maxPoolSizeElement || !failedCooldownElement || !maxBackupPoolSizeElement) {
       showToast('设置项元素未找到', 'error');
       return false;
     }
     
     const maxPoolSize = parseInt(maxPoolSizeElement.value) || 50;
     const failedCooldown = parseInt(failedCooldownElement.value) || 15;
-    const clearFailed = clearFailedElement.checked;
+    const maxBackupPoolSize = parseInt(maxBackupPoolSizeElement.value) || 50;
     
     if (maxPoolSize < 10 || maxPoolSize > 100) { showToast('带宽池容量必须在10-100之间', 'error'); return false; }
     if (failedCooldown < 1 || failedCooldown > 30) { showToast('冷却天数必须在1-30之间', 'error'); return false; }
+    if (maxBackupPoolSize < 50 || maxBackupPoolSize > 500) { showToast('备用池容量必须在50-500之间', 'error'); return false; }
     
     try {
-      const res = await fetch('/api/save-advanced-config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ maxHighQualityPoolSize: maxPoolSize, failedIpCooldownDays: failedCooldown, clearFailedIPs: clearFailed }) });
+      const res = await fetch('/api/save-advanced-config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ maxHighQualityPoolSize: maxPoolSize, failedIpCooldownDays: failedCooldown, maxBackupPoolSize: maxBackupPoolSize }) });
       if (!res.ok) {
         throw new Error('网络请求失败');
       }
       const data = await res.json();
-      if (data.success) { if (clearFailed) showToast('失败IP黑名单已清空', 'success'); await loadAdvancedConfig(); return true; }
+      if (data.success) { showToast('高级设置保存成功', 'success'); await loadAdvancedConfig(); return true; }
       else { showToast('高级设置保存失败', 'error'); return false; }
     } catch(e) { showToast('高级设置保存失败: ' + e.message, 'error'); return false; }
   }
@@ -3588,19 +4295,23 @@ async function getMainHTML(env) {
       const data = await res.json();
       const maxPoolSize = document.getElementById('maxPoolSize');
       const failedCooldown = document.getElementById('failedCooldown');
+      const maxBackupPoolSize = document.getElementById('maxBackupPoolSize');
       if (maxPoolSize) maxPoolSize.value = data.maxHighQualityPoolSize || 30;
       if (failedCooldown) failedCooldown.value = data.failedIpCooldownDays || 15;
+      if (maxBackupPoolSize) maxBackupPoolSize.value = data.maxBackupPoolSize || 50;
     } catch(e) {
       const maxPoolSize = document.getElementById('maxPoolSize');
       const failedCooldown = document.getElementById('failedCooldown');
+      const maxBackupPoolSize = document.getElementById('maxBackupPoolSize');
       if (maxPoolSize) maxPoolSize.value = 30;
       if (failedCooldown) failedCooldown.value = 15;
+      if (maxBackupPoolSize) maxBackupPoolSize.value = 50;
     }
   }
 
   async function saveUIConfig() {
     const ipCount = parseInt(document.getElementById('ipCount').value) || 3;
-    const testCount = parseInt(document.getElementById('testCount').value) || 50;
+    const testCount = parseInt(document.getElementById('testCount').value) || 30;
     const threadCount = parseInt(document.getElementById('threadCount').value) || 10;
     const bandwidthFileSize = parseInt(document.getElementById('bandwidthFileSize').value) || 3;
     try {
@@ -3654,7 +4365,7 @@ async function getMainHTML(env) {
       const threadCount = document.getElementById('threadCount');
       const bandwidthFileSize = document.getElementById('bandwidthFileSize');
       if (ipCount) ipCount.value = data.ipCount || 3;
-      if (testCount) testCount.value = data.testCount || 50;
+      if (testCount) testCount.value = data.testCount || 30;
       if (threadCount) threadCount.value = data.threadCount || 10;
       if (bandwidthFileSize) bandwidthFileSize.value = data.bandwidthFileSize || 3;
     } catch(e) {
@@ -3663,16 +4374,13 @@ async function getMainHTML(env) {
       const threadCount = document.getElementById('threadCount');
       const bandwidthFileSize = document.getElementById('bandwidthFileSize');
       if (ipCount) ipCount.value = 3;
-      if (testCount) testCount.value = 50;
+      if (testCount) testCount.value = 30;
       if (threadCount) threadCount.value = 10;
       if (bandwidthFileSize) bandwidthFileSize.value = 3;
     }
   }
   
-  document.getElementById('search').addEventListener('input', () => renderTable());
-  
   window.onload = async () => {
-    restoreIPTableState();
     if (await checkAuth()) {
       await Promise.all([loadVisitorInfo(), loadIPs(true), loadLogs(), loadPoolStats(), loadUIConfig(), loadAdvancedConfig()]);
       setInterval(() => loadLogs(), 5000);
@@ -3839,6 +4547,22 @@ function getSettingsHTML(env) {
       <div class="checkbox">
         <input type="checkbox" id="autoUpdateAfterTest"> <label>测速完成后自动更新DNS</label>
       </div>
+      <div class="form-group" style="margin-top: 12px;">
+        <label>自动更新DNS排序方式</label>
+        <select id="autoUpdateSortBy">
+          <option value="score">📊 综合评分 (推荐)</option>
+          <option value="bandwidth">⚡ 带宽优先</option>
+          <option value="latency">🚀 延迟优先</option>
+        </select>
+        <div class="info-text">选择自动更新DNS时IP的排序依据</div>
+      </div>
+      <div class="form-group" style="margin-top: 20px;">
+        <label>国家域名映射 (按国家更新DNS)</label>
+        <div id="countryDomainsContainer">
+          <div class="info-text">点击下方按钮添加国家域名映射</div>
+        </div>
+        <button class="btn btn-secondary" style="margin-top: 10px;" onclick="addCountryDomain()">➕ 添加国家域名映射</button>
+      </div>
       <div class="action-bar">
         <button class="btn btn-primary full-width" onclick="saveAllConfig()">💾 保存DNS配置</button>
       </div>
@@ -3893,48 +4617,6 @@ function getSettingsHTML(env) {
       </div>
       <div class="action-bar">
         <button class="btn btn-primary full-width" onclick="saveLogConfig()">💾 保存日志配置</button>
-      </div>
-    </div>
-  </div>
-
-  <div class="card">
-    <div class="card-header" onclick="toggleCard(this)">
-      <h2>🚀 带宽优先算法说明</h2>
-      <span class="toggle-icon">▶</span>
-    </div>
-    <div class="card-body collapsed">
-      <div class="strategy-info">
-        <h3>📊 评分公式</h3>
-        <p>带宽分数 × 80% + 延迟分数 × 20%</p>
-        
-        <h3>🎯 带宽池准入标准</h3>
-        <p>带宽 ≥ 100Mbps，小于100Mbps进入备用池</p>
-        
-        <h3>✨ 优秀带宽</h3>
-        <p>≥500Mbps 直接加入带宽池</p>
-        
-        <h3>🔄 池内替换规则</h3>
-        <p>只有带宽更高的IP才能替换池中成员</p>
-        
-        <h3>⚡ 测试优先级</h3>
-        <p>优先测试历史高带宽IP，带宽优质池大于备用池大于总IP池大于失败池</p>
-        
-        <h3>✅ 确保优选池中都是高带宽IP，保障传输速度</h3>
-      </div>
-    </div>
-  </div>
-
-  <div class="card">
-    <div class="card-header" onclick="toggleCard(this)">
-      <h2>🤖 测速策略</h2>
-      <span class="toggle-icon">▶</span>
-    </div>
-    <div class="card-body collapsed">
-      <div class="strategy-info">
-        <div style="margin-bottom: 12px;">📅 Cron定时任务会根据地区IP数量智能选择测速地区</div>
-        <div style="margin-bottom: 12px;">🎯 优先维护IP不足的亚洲地区</div>
-        <div style="margin-bottom: 12px;">🌍 亚洲时间0-6点会进行全球维护</div>
-        <div style="color: #94a3b8; font-size: 12px;">系统会自动管理测速策略，无需手动配置</div>
       </div>
     </div>
   </div>
@@ -4350,11 +5032,82 @@ function getSettingsHTML(env) {
       document.getElementById('proxied').value = data.proxied !== undefined ? (data.proxied ? 'true' : 'false') : 'false';
       document.getElementById('autoUpdate').checked = data.autoUpdate || false;
       document.getElementById('autoUpdateAfterTest').checked = data.autoUpdateAfterTest || false;
+      document.getElementById('autoUpdateSortBy').value = data.autoUpdateSortBy || 'score';
       document.getElementById('telegramEnabled').checked = data.telegramEnabled || false;
       document.getElementById('telegramBotToken').value = data.telegramBotToken || '';
       document.getElementById('telegramChatId').value = data.telegramChatId || '';
       document.getElementById('telegramHideIP').checked = data.telegramHideIP !== false;
       toggleTelegramConfig();
+      
+      // 加载国家域名映射
+      const container = document.getElementById('countryDomainsContainer');
+      container.innerHTML = '';
+      
+      if (data.countryDomains && typeof data.countryDomains === 'object') {
+        const countryDomains = data.countryDomains;
+        const countryCodes = Object.keys(countryDomains);
+        
+        if (countryCodes.length > 0) {
+          countryCodes.forEach(country => {
+            const domain = countryDomains[country];
+            const domainItem = document.createElement('div');
+            domainItem.className = 'country-domain-item';
+            domainItem.style.display = 'flex';
+            domainItem.style.alignItems = 'center';
+            domainItem.style.marginTop = '10px';
+            domainItem.style.padding = '10px';
+            domainItem.style.backgroundColor = '#1e293b';
+            domainItem.style.borderRadius = '8px';
+            
+            // 创建选择框
+            const select = document.createElement('select');
+            select.className = 'country-select';
+            select.style.flex = '1';
+            select.style.marginRight = '10px';
+            
+            // 添加选项
+            const countryNames = {"CN":"中国","US":"美国","JP":"日本","SG":"新加坡","KR":"韩国","DE":"德国","GB":"英国","FR":"法国","CA":"加拿大","AU":"澳大利亚","IN":"印度","TW":"台湾","HK":"香港","MO":"澳门","unknown":"未知"};
+            Object.entries(countryNames).forEach(([code, name]) => {
+              const option = document.createElement('option');
+              option.value = code;
+              option.textContent = code + ' - ' + name;
+              if (code === country) {
+                option.selected = true;
+              }
+              select.appendChild(option);
+            });
+            
+            // 创建输入框
+            const input = document.createElement('input');
+            input.type = 'text';
+            input.className = 'domain-input';
+            input.placeholder = '例如: cn.yourdomain.com';
+            input.value = domain;
+            input.style.flex = '2';
+            input.style.marginRight = '10px';
+            
+            // 创建删除按钮
+            const button = document.createElement('button');
+            button.className = 'btn btn-danger';
+            button.style.padding = '6px 12px';
+            button.textContent = '❌';
+            button.onclick = function() {
+              removeCountryDomain(this);
+            };
+            
+            // 组装元素
+            domainItem.appendChild(select);
+            domainItem.appendChild(input);
+            domainItem.appendChild(button);
+            
+            container.appendChild(domainItem);
+          });
+        } else {
+          container.innerHTML = '<div class="info-text">点击下方按钮添加国家域名映射</div>';
+        }
+      } else {
+        container.innerHTML = '<div class="info-text">点击下方按钮添加国家域名映射</div>';
+      }
     } catch(e) { 
       showToast('加载配置失败: ' + e.message, 'error'); 
     }
@@ -4421,7 +5174,73 @@ function getSettingsHTML(env) {
     inputs.forEach(input => { input.disabled = !enabled; });
   }
   
+  function addCountryDomain() {
+    const container = document.getElementById('countryDomainsContainer');
+    const domainItem = document.createElement('div');
+    domainItem.className = 'country-domain-item';
+    domainItem.style.display = 'flex';
+    domainItem.style.alignItems = 'center';
+    domainItem.style.marginTop = '10px';
+    domainItem.style.padding = '10px';
+    domainItem.style.backgroundColor = '#1e293b';
+    domainItem.style.borderRadius = '8px';
+    
+    // 创建选择框
+    const select = document.createElement('select');
+    select.className = 'country-select';
+    select.style.flex = '1';
+    select.style.marginRight = '10px';
+    
+    // 添加选项
+    const countryNames = {"CN":"中国","US":"美国","JP":"日本","SG":"新加坡","KR":"韩国","DE":"德国","GB":"英国","FR":"法国","CA":"加拿大","AU":"澳大利亚","IN":"印度","TW":"台湾","HK":"香港","MO":"澳门","unknown":"未知"};
+    Object.entries(countryNames).forEach(([code, name]) => {
+      const option = document.createElement('option');
+      option.value = code;
+      option.textContent = code + ' - ' + name;
+      select.appendChild(option);
+    });
+    
+    // 创建输入框
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'domain-input';
+    input.placeholder = '例如: cn.yourdomain.com';
+    input.style.flex = '2';
+    input.style.marginRight = '10px';
+    
+    // 创建删除按钮
+    const button = document.createElement('button');
+    button.className = 'btn btn-danger';
+    button.style.padding = '6px 12px';
+    button.textContent = '❌';
+    button.onclick = function() {
+      removeCountryDomain(this);
+    };
+    
+    // 组装元素
+    domainItem.appendChild(select);
+    domainItem.appendChild(input);
+    domainItem.appendChild(button);
+    
+    container.appendChild(domainItem);
+  }
+  
+  function removeCountryDomain(btn) {
+    const item = btn.closest('.country-domain-item');
+    item.remove();
+  }
+  
   async function saveAllConfig() {
+    const countryDomains = {};
+    const domainItems = document.querySelectorAll('.country-domain-item');
+    domainItems.forEach(item => {
+      const country = item.querySelector('.country-select').value;
+      const domain = item.querySelector('.domain-input').value.trim();
+      if (country && domain) {
+        countryDomains[country] = domain;
+      }
+    });
+    
     const config = {
       apiToken: document.getElementById('apiToken').value.trim(),
       zoneId: document.getElementById('zoneId').value.trim(),
@@ -4429,15 +5248,19 @@ function getSettingsHTML(env) {
       proxied: document.getElementById('proxied').value === 'true',
       autoUpdate: document.getElementById('autoUpdate').checked,
       autoUpdateAfterTest: document.getElementById('autoUpdateAfterTest').checked,
+      autoUpdateSortBy: document.getElementById('autoUpdateSortBy').value || 'score',
+      countryDomains: countryDomains,
       telegramEnabled: document.getElementById('telegramEnabled').checked,
       telegramBotToken: document.getElementById('telegramBotToken').value.trim(),
       telegramChatId: document.getElementById('telegramChatId').value.trim(),
       telegramHideIP: document.getElementById('telegramHideIP').checked
     };
+    
     if (config.telegramEnabled && (!config.telegramBotToken || !config.telegramChatId)) {
       showToast('启用 Telegram 通知时，Bot Token 和 Chat ID 不能为空', 'error'); 
       return;
     }
+    
     const btn = event.target;
     btn.disabled = true; 
     btn.textContent = '保存中...';
@@ -4509,7 +5332,6 @@ export default {
 
     ctx.waitUntil((async () => {
       await initDatabase(env);
-      await runD1Migrations(env);
     })().catch(() => {}));
     ctx.waitUntil(cleanExpiredFailedIPs(env).catch(() => {}));
     ctx.waitUntil(cleanExpiredGeoCache(env).catch(() => {}));
@@ -4606,16 +5428,69 @@ export default {
       }
     }
     
-    if (path === '/api/get-quality-mode') {
-      const mode = await getQualityMode(env);
-      const reliability = await checkBandwidthReliability(env);
-      return new Response(JSON.stringify({ success: true, mode, bandwidthReliable: reliability.reliable, abnormalRate: reliability.rate }), { headers: { 'Content-Type': 'application/json' } });
-    }
+
     if (path === '/api/force-clean-pool' && request.method === 'POST') {
       const result = await cleanHighQualityPool(env, true);
       highQualityCache.clear();
       await addSystemLog(env, `🔧 手动强制清理带宽池完成`);
       return new Response(JSON.stringify(result), { headers: { 'Content-Type': 'application/json' } });
+    }
+    if (path === '/api/backup-pool-ips') {
+      const country = url.searchParams.get('country');
+      const minBandwidth = parseInt(url.searchParams.get('minBandwidth')) || 0;
+      const maxLatency = parseInt(url.searchParams.get('maxLatency')) || 9999;
+      const sortBy = url.searchParams.get('sortBy') || 'bandwidth';
+      const limit = parseInt(url.searchParams.get('limit')) || 100;
+      
+      try {
+        let sql = `
+          SELECT ip, latency, bandwidth, country, city, last_tested 
+          FROM backup_quality_ips 
+          WHERE 1=1
+        `;
+        const params = [];
+        
+        if (country && country !== 'all') {
+          sql += ` AND country = ?`;
+          params.push(country);
+        }
+        if (minBandwidth > 0) {
+          sql += ` AND bandwidth >= ?`;
+          params.push(minBandwidth);
+        }
+        if (maxLatency < 9999) {
+          sql += ` AND latency <= ?`;
+          params.push(maxLatency);
+        }
+        
+        // 排序
+        if (sortBy === 'bandwidth') {
+          sql += ` ORDER BY (CASE WHEN bandwidth IS NULL OR bandwidth = 0 THEN 0 ELSE bandwidth END) DESC, latency ASC`;
+        } else if (sortBy === 'latency') {
+          sql += ` ORDER BY latency ASC, (CASE WHEN bandwidth IS NULL OR bandwidth = 0 THEN 0 ELSE bandwidth END) DESC`;
+        } else if (sortBy === 'country') {
+          sql += ` ORDER BY country ASC, (CASE WHEN bandwidth IS NULL OR bandwidth = 0 THEN 0 ELSE bandwidth END) DESC`;
+        }
+        
+        sql += ` LIMIT ?`;
+        params.push(limit);
+        
+        const result = await env.DB.prepare(sql).bind(...params).all();
+        
+        // 获取所有国家列表（用于筛选）
+        const countriesResult = await env.DB.prepare(`
+          SELECT DISTINCT country FROM backup_quality_ips ORDER BY country
+        `).all();
+        
+        return new Response(JSON.stringify({
+          success: true,
+          ips: result.results || [],
+          countries: countriesResult.results?.map(r => r.country) || [],
+          total: result.results?.length || 0
+        }), { headers: { 'Content-Type': 'application/json' } });
+      } catch (error) {
+        return new Response(JSON.stringify({ success: false, error: error.message }), { headers: { 'Content-Type': 'application/json' } });
+      }
     }
     if (path === '/api/visitor-info') return handleVisitorInfo(request, env);
     if (path === '/api/region-stats') {
@@ -4626,9 +5501,62 @@ export default {
       const quality = await handleRegionQuality(env);
       return new Response(JSON.stringify(quality), { headers: { 'Content-Type': 'application/json' } });
     }
-    if (path === '/api/speed-strategy') {
-      const strategy = await handleSpeedStrategy(env);
-      return new Response(JSON.stringify(strategy), { headers: { 'Content-Type': 'application/json' } });
+    if (path === '/api/bandwidth-pool-ips') {
+      const country = url.searchParams.get('country');
+      const minBandwidth = parseInt(url.searchParams.get('minBandwidth')) || 0;
+      const maxLatency = parseInt(url.searchParams.get('maxLatency')) || 9999;
+      const sortBy = url.searchParams.get('sortBy') || 'bandwidth';
+      const limit = parseInt(url.searchParams.get('limit')) || 100;
+      
+      try {
+        let sql = `
+          SELECT ip, latency, bandwidth, country, city, last_tested 
+          FROM high_quality_ips 
+          WHERE 1=1
+        `;
+        const params = [];
+        
+        if (country && country !== 'all') {
+          sql += ` AND country = ?`;
+          params.push(country);
+        }
+        if (minBandwidth > 0) {
+          sql += ` AND bandwidth >= ?`;
+          params.push(minBandwidth);
+        }
+        if (maxLatency < 9999) {
+          sql += ` AND latency <= ?`;
+          params.push(maxLatency);
+        }
+        
+        // 排序
+        if (sortBy === 'bandwidth') {
+          sql += ` ORDER BY (CASE WHEN bandwidth IS NULL OR bandwidth = 0 THEN 0 ELSE bandwidth END) DESC, latency ASC`;
+        } else if (sortBy === 'latency') {
+          sql += ` ORDER BY latency ASC, (CASE WHEN bandwidth IS NULL OR bandwidth = 0 THEN 0 ELSE bandwidth END) DESC`;
+        } else if (sortBy === 'country') {
+          sql += ` ORDER BY country ASC, (CASE WHEN bandwidth IS NULL OR bandwidth = 0 THEN 0 ELSE bandwidth END) DESC`;
+        }
+        
+        sql += ` LIMIT ?`;
+        params.push(limit);
+        
+        const result = await env.DB.prepare(sql).bind(...params).all();
+        
+        // 获取所有国家列表（用于筛选）
+        const countriesResult = await env.DB.prepare(`
+          SELECT DISTINCT country FROM high_quality_ips ORDER BY country
+        `).all();
+        
+        return new Response(JSON.stringify({
+          success: true,
+          ips: result.results || [],
+          countries: countriesResult.results?.map(r => r.country) || [],
+          total: result.results?.length || 0
+        }), { headers: { 'Content-Type': 'application/json' } });
+      } catch (error) {
+        return new Response(JSON.stringify({ success: false, error: error.message }), { headers: { 'Content-Type': 'application/json' } });
+      }
     }
     if (path === '/api/visitor-aware-speedtest' && request.method === 'POST') {
       const { country } = await request.json();
@@ -4776,6 +5704,54 @@ export default {
         }
       });
     }
+    if (path === '/api/export-backup-ips') {
+      const backupIPs = await getBackupPoolIPs(env);
+      const countryNames = {
+        'CN': '中国', 'US': '美国', 'JP': '日本', 'SG': '新加坡',
+        'KR': '韩国', 'DE': '德国', 'GB': '英国', 'FR': '法国',
+        'CA': '加拿大', 'AU': '澳大利亚', 'IN': '印度',
+        'TW': '台湾', 'HK': '香港', 'MO': '澳门', 'unknown': '未知'
+      };
+      const calculateScore = function(l, b) {
+        var ls = 0;
+        if (l <= 50) ls = 100;
+        else if (l <= 100) ls = 90;
+        else if (l <= 150) ls = 80;
+        else if (l <= 200) ls = 70;
+        else if (l <= 250) ls = 60;
+        else ls = 50;
+        var bs = 0;
+        if (!b || b === 0) bs = 0;
+        else if (b >= 1000) bs = 100;
+        else if (b >= 500) bs = 95;
+        else if (b >= 300) bs = 90;
+        else if (b >= 200) bs = 85;
+        else if (b >= 100) bs = 80;
+        else if (b >= 50) bs = 60;
+        else if (b >= 20) bs = 40;
+        else bs = 20;
+        return Math.round(bs * 0.8 + ls * 0.2);
+      };
+      var headers = ['IP 地址', '延迟 (ms)', '带宽 (Mbps)', '评分', '地区'];
+      var rows = backupIPs.map(function(item) {
+        var cn = countryNames[item.country] || item.country || '未知';
+        var score = calculateScore(item.latency, item.bandwidth);
+        return [
+          item.ip,
+          item.latency,
+          item.bandwidth || '未测',
+          score,
+          cn
+        ];
+      });
+      var csvContent = '\uFEFF' + [headers.join(',')].concat(rows.map(function(row) { return row.join(','); })).join('\n');
+      return new Response(csvContent, {
+        headers: {
+          'Content-Type': 'text/csv;charset=utf-8',
+          'Content-Disposition': 'attachment; filename="CF_BackupIP_' + new Date().toISOString().split('T')[0] + '.csv"'
+        }
+      });
+    }
     if (path === '/api/get-ui-config') {
       const savedConfig = await env.KV.get(CONFIG.kvKeys.uiConfig, 'json') || {};
       return new Response(JSON.stringify({ 
@@ -4799,22 +5775,31 @@ export default {
     }
     if (path === '/api/get-advanced-config') {
       const advancedConfig = await getAdvancedConfig(env);
+      await addSystemLog(env, `🔍 获取高级配置: maxBackupPoolSize=${advancedConfig.maxBackupPoolSize}`);
       return new Response(JSON.stringify(advancedConfig), { headers: { 'Content-Type': 'application/json' } });
     }
     if (path === '/api/save-advanced-config' && request.method === 'POST') {
-      const { maxHighQualityPoolSize, failedIpCooldownDays, clearFailedIPs } = await request.json();
+      const { maxHighQualityPoolSize, failedIpCooldownDays, maxBackupPoolSize } = await request.json();
       const advancedConfig = {
         maxHighQualityPoolSize: Math.min(100, Math.max(10, parseInt(maxHighQualityPoolSize) || 50)),
-        failedIpCooldownDays: Math.min(30, Math.max(1, parseInt(failedIpCooldownDays) || 15))
+        failedIpCooldownDays: Math.min(30, Math.max(1, parseInt(failedIpCooldownDays) || 15)),
+        maxBackupPoolSize: Math.min(500, Math.max(50, parseInt(maxBackupPoolSize) || 50))
       };
       await env.KV.put(CONFIG.kvKeys.advancedConfig, JSON.stringify(advancedConfig));
-      if (clearFailedIPs) {
-        await env.DB.prepare('DELETE FROM failed_ips').run();
-        await addSystemLog(env, '🗑️ 失败IP黑名单已手动清空');
-      }
+      await addSystemLog(env, `💾 保存高级配置: maxBackupPoolSize=${advancedConfig.maxBackupPoolSize}`);
       const cleanResult = await cleanHighQualityPool(env, false);
       await addSystemLog(env, `⚙️ 高级设置已保存`);
       return new Response(JSON.stringify({ success: true, config: advancedConfig, cleanResult }), { headers: { 'Content-Type': 'application/json' } });
+    }
+    if (path === '/api/clear-failed-ips' && request.method === 'POST') {
+      try {
+        await env.DB.prepare('DELETE FROM failed_ips').run();
+        await addSystemLog(env, '🗑️ 失败IP黑名单已手动清空');
+        return new Response(JSON.stringify({ success: true, message: '失败IP黑名单已清空' }), { headers: { 'Content-Type': 'application/json' } });
+      } catch (e) {
+        await addSystemLog(env, `❌ 清空失败IP黑名单失败: ${e.message}`);
+        return new Response(JSON.stringify({ success: false, error: e.message }), { headers: { 'Content-Type': 'application/json' } });
+      }
     }
     if (path === '/api/get-config') {
       const dnsConfig = await env.KV.get(CONFIG.kvKeys.dnsConfig, 'json') || {};
@@ -4937,12 +5922,45 @@ export default {
         targetIPs = bestIPs.map(item => item.ip);
       }
       if (!targetIPs || targetIPs.length === 0) return new Response(JSON.stringify({ error: '无可用IP' }), { status: 400 });
-      const result = await updateDNSBatch(env, targetIPs, triggerSource || 'manual');
+      
+      // 检查是否有国家域名映射，如果没有默认域名但有国家域名映射，使用第一个国家域名
+      const dnsConfig = await env.KV.get(CONFIG.kvKeys.dnsConfig, 'json');
+      const countryDomains = dnsConfig?.countryDomains || {};
+      let targetDomain = null;
+      if (!dnsConfig?.recordName && Object.keys(countryDomains).length > 0) {
+        const firstCountry = Object.keys(countryDomains)[0];
+        targetDomain = countryDomains[firstCountry];
+      }
+      
+      const result = await updateDNSBatch(env, targetIPs, triggerSource || 'manual', targetDomain);
+      return new Response(JSON.stringify(result), { headers: { 'Content-Type': 'application/json' } });
+    }
+    if (path === '/api/update-dns-by-country' && request.method === 'POST') {
+      const { country, ips, count, triggerSource } = await request.json();
+      if (!country) return new Response(JSON.stringify({ error: '缺少国家参数' }), { status: 400 });
+      let targetIPs = ips;
+      if (!targetIPs) {
+        const config = getEnvConfig(env);
+        const ipCount = count || config.defaultIpCount;
+        const bestIPs = await getBestIPs(env, country, ipCount);
+        targetIPs = bestIPs.map(item => item.ip);
+      }
+      if (!targetIPs || targetIPs.length === 0) return new Response(JSON.stringify({ error: '无可用IP' }), { status: 400 });
+      const result = await updateDNSByCountry(env, country, targetIPs, triggerSource || 'manual');
+      return new Response(JSON.stringify(result), { headers: { 'Content-Type': 'application/json' } });
+    }
+    if (path === '/api/update-dns-all-countries' && request.method === 'POST') {
+      const { triggerSource } = await request.json();
+      const result = await updateDNSForAllCountries(env, triggerSource || 'manual');
       return new Response(JSON.stringify(result), { headers: { 'Content-Type': 'application/json' } });
     }
     if (path === '/api/db-status') {
       const status = await handleDBStatus(env);
       return new Response(JSON.stringify(status), { headers: { 'Content-Type': 'application/json' } });
+    }
+    if (path === '/api/update-dns-smart-routing' && request.method === 'POST') {
+      const result = await updateDNSSmartRouting(env, 'manual');
+      return new Response(JSON.stringify(result), { headers: { 'Content-Type': 'application/json' } });
     }
 
     return new Response('Not Found', { status: 404 });
@@ -4951,64 +5969,126 @@ export default {
   async scheduled(event, env, ctx) {
     await addSystemLog(env, `⏰ Cron定时任务启动`);
     try {
-      await initDatabase(env);
-      await runD1Migrations(env);
-      await cleanExpiredFailedIPs(env);
-      await cleanHighQualityPool(env);
-      await cleanExpiredGeoCache(env);
-      await cleanExpiredLogs(env);
-      await flushLogs(env);
-      await updateRegionQuality(env);
+      // 执行智能测速
+      const testResult = await smartSpeedTest(env, { 
+        maxConcurrent: 1,
+        batchDelay: 3000,
+        maxRetries: 1,
+        timeout: 12000
+      }, ctx);
       
-      const strategy = await getSpeedStrategy(env);
-      let targetCountry = null;
-      let logMessage = '';
+      await addSystemLog(env, `✅ 测速完成: 成功 ${testResult.successCount || 0}, 失败 ${testResult.failCount || 0}`);
       
-      switch (strategy.type) {
-        case 'urgent':
-          targetCountry = strategy.country;
-          logMessage = `🚨 紧急补充: ${COUNTRY_NAMES[targetCountry]} 地区 (仅${strategy.count}个IP)`;
-          break;
-        case 'maintain':
-          targetCountry = strategy.country;
-          logMessage = `🔄 常规维护: ${COUNTRY_NAMES[targetCountry]} 地区 (当前${strategy.count}个IP)`;
-          break;
-        case 'global':
-          targetCountry = null;
-          logMessage = `🌍 全球维护测速 (第${strategy.globalCount}次)`;
-          break;
-        default:
-          targetCountry = 'CN';
-          logMessage = `🎯 默认测速: 中国地区`;
-      }
-      
-      await addSystemLog(env, logMessage);
-      await smartSpeedTest(env, { maxConcurrent: 2, batchDelay: 2000 }, ctx);
-      await updateSpeedStrategy(env, targetCountry);
-      await updateRegionStats(env);
-      await updateRegionQuality(env);
-      
-      const dnsConfig = await env.KV.get(CONFIG.kvKeys.dnsConfig, 'json');
-      if (dnsConfig?.autoUpdate) {
-        const config = getEnvConfig(env);
-        const uiConfig = await env.KV.get(CONFIG.kvKeys.uiConfig, 'json') || {};
-        const ipCount = uiConfig.ipCount || config.defaultIpCount;
-        const bestIPs = await getBestIPs(env, 'CN', ipCount);
-        if (bestIPs.length > 0) {
-          await updateDNSBatch(env, bestIPs.map(item => item.ip), 'cron');
+      // 后台执行后续操作
+      ctx.waitUntil((async () => {
+        try {
+          await new Promise(resolve => setTimeout(resolve, 1000));
+          await updateRegionStats(env);
+          await updateRegionQuality(env);
+          await LogManager.flush(env);
+          
+          // 延迟2秒后执行DNS更新
+          await new Promise(resolve => setTimeout(resolve, 2000));
+          const dnsConfig = await env.KV.get(CONFIG.kvKeys.dnsConfig, 'json');
+          let dnsUpdateSuccess = false;
+          let updatedIPs = [];
+          
+          if (dnsConfig?.autoUpdate) {
+            const config = getEnvConfig(env);
+            const uiConfig = await env.KV.get(CONFIG.kvKeys.uiConfig, 'json') || {};
+            const ipCount = uiConfig.ipCount || config.defaultIpCount;
+            const sortBy = dnsConfig?.autoUpdateSortBy || 'score';
+            await addSystemLog(env, `🔍 Cron自动更新DNS排序方式: ${sortBy}`);
+            
+            // 检查是否有国家域名映射
+            const countryDomains = dnsConfig?.countryDomains || {};
+            const hasCountryDomains = Object.keys(countryDomains).length > 0;
+            
+            // 检查是否启用多国家自动更新（默认启用）
+            const enableMultiCountry = dnsConfig?.enableMultiCountryUpdate !== false;
+            
+            if (hasCountryDomains && enableMultiCountry) {
+              // 使用智能分流更新所有国家
+              await addSystemLog(env, `🌍 Cron启用多国家DNS自动更新，共 ${Object.keys(countryDomains).length} 个国家`);
+              try {
+                const multiResult = await updateDNSSmartRouting(env, 'cron');
+                if (multiResult.success) {
+                  dnsUpdateSuccess = true;
+                  updatedIPs = multiResult.updatedCountries || [];
+                  await addSystemLog(env, `✅ Cron多国家DNS自动更新成功: ${multiResult.successCount}/${multiResult.totalCount} 个国家`);
+                } else {
+                  await addSystemLog(env, `❌ Cron多国家DNS自动更新失败: ${multiResult.error}`);
+                }
+              } catch (multiError) {
+                await addSystemLog(env, `❌ Cron多国家DNS更新异常: ${multiError.message}`);
+              }
+            } else {
+              // 单国家更新模式
+              let targetCountry = 'CN';
+              let targetDomain = dnsConfig?.recordName;
+              
+              if (hasCountryDomains) {
+                if (countryDomains['CN']) {
+                  targetCountry = 'CN';
+                  targetDomain = countryDomains['CN'];
+                } else {
+                  const firstCountry = Object.keys(countryDomains)[0];
+                  targetCountry = firstCountry;
+                  targetDomain = countryDomains[firstCountry];
+                }
+              }
+              
+              try {
+                const bestIPs = await getBestIPs(env, targetCountry, ipCount, sortBy);
+                if (bestIPs.length > 0) {
+                  const ipList = bestIPs.map(item => item.ip);
+                  const dnsResult = await updateDNSBatch(env, ipList, 'cron', targetDomain);
+                  if (dnsResult.success) {
+                    dnsUpdateSuccess = true;
+                    updatedIPs = ipList;
+                    await addSystemLog(env, `✅ Cron自动更新DNS成功: ${dnsResult.count} 个IP (域名: ${targetDomain || '默认'})`);
+                  } else {
+                    await addSystemLog(env, `❌ Cron自动更新DNS失败: ${dnsResult.error}`);
+                  }
+                }
+              } catch (dnsError) {
+                await addSystemLog(env, `❌ Cron DNS更新异常: ${dnsError.message}`);
+              }
+            }
+          }
+          
+          // 延迟1秒后发送通知
+          await new Promise(resolve => setTimeout(resolve, 1000));
+          await sendTelegramNotification(env, {
+            message: {
+              source: '定时任务',
+              ipCount: testResult.successCount || 0,
+              failCount: testResult.failCount || 0,
+              bandwidthCount: testResult.bandwidthCount || 0,
+              dnsUpdated: dnsUpdateSuccess,
+              updatedIPs: updatedIPs.length
+            },
+            type: 'info'
+          });
+        } catch (error) {
+          await addSystemLog(env, `❌ Cron后台任务异常: ${error.message}`);
         }
-      }
+      })());
       
-      await addSystemLog(env, `✅ Cron定时任务完成`);
-      await sendTelegramNotification(env, {
-        message: {
-          source: '定时任务',
-          ipCount: 0
-        },
-        type: 'info'
-      });
+      await addSystemLog(env, `✅ Cron定时任务主流程完成`);
+      
     } catch (error) {
       await addSystemLog(env, `❌ Cron定时任务异常: ${error.message}`);
+      await LogManager.flush(env);
+
+      ctx.waitUntil(sendTelegramNotification(env, {
+        message: {
+          source: '定时任务异常',
+          error: error.message,
+          stack: error.stack?.substring(0, 500) || '无堆栈信息'
+        },
+        type: 'error'
+      }).catch(() => {}));
     }
   }
 };
