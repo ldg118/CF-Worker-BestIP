@@ -275,12 +275,13 @@ cf-best-ip/
 | ------------------------- | ---------- | --------------- | ------------ | -------- |
 | `worker.js`               | ✅ 直接使用     | ✅ 直接使用          | ⚠️ 可选（优先使用 _worker.js） | 主程序文件    |
 | `_worker.js`              | ❌ 不使用      | ❌ 不使用           | ✅ 直接使用          | 主程序文件（Pages 专用） |
+| `functions/[[path]].js`   | ❌ 不使用      | ✅ 推荐使用          | ✅ 推荐使用          | Pages Functions 入口（推荐） |
 | `wrangler.toml`           | ✅ 必需       | ⚠️ 可选            | ⚠️ 可选         | 配置文件     |
 | `migrations/001_init.sql` | ✅ 必需       | ✅ 必需            | ✅ 必需         | 数据库初始化脚本 |
 
 > **注意**：
-> - **Pages 自动部署（Git）**：直接使用 `worker.js`，无需重命名
-> - **Pages 直接上传**：使用 `_worker.js`，这是 Cloudflare Pages 的命名规范
+> - **Pages 自动部署（Git）**：推荐使用 `functions/[[path]].js`，这是 Pages 的现代推荐方式
+> - **Pages 直接上传**：可以使用 `_worker.js` 或 `functions/[[path]].js`
 > - **Workers 部署**：直接使用 `worker.js`，无需重命名
 
 ### 部署方式对比
@@ -288,8 +289,8 @@ cf-best-ip/
 | 方式                  | 文件要求         | 定时任务  | 推荐度     |
 | ------------------- | ------------ | ----- | ------- |
 | **方式一 Workers**     | `worker.js`  | ✅ 支持  | ⭐⭐⭐ 最推荐 |
-| **方式二 A Pages 自动部署（Git）** | `worker.js`  | ❌ 不支持 | ⭐⭐ 推荐   |
-| **方式二 B Pages 直接上传**  | `_worker.js` | ❌ 不支持 | ⭐⭐ 推荐   |
+| **方式二 A Pages 自动部署（Git）** | `functions/[[path]].js`  | ❌ 不支持 | ⭐⭐ 推荐   |
+| **方式二 B Pages 直接上传**  | `_worker.js` 或 `functions/[[path]].js` | ❌ 不支持 | ⭐⭐ 推荐   |
 
 ***
 
