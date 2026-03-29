@@ -6422,17 +6422,47 @@ async function optimizedDNSUpdateLimited(env, ctx, maxSubrequests, dnsIPCount = 
     }
     
     const successCount = results.filter(r => r.success).length;
+    
+    // 收集所有成功更新的IP
+    const allUpdatedIPs = results
+      .filter(r => r.success && r.updatedIPs && r.updatedIPs.length > 0)
+      .flatMap(r => r.updatedIPs);
+    
+    // 查询这些IP的详细信息（从high_quality_ips表）
+    let updatedIPDetails = [];
+    if (allUpdatedIPs.length > 0) {
+      try {
+        const placeholders = allUpdatedIPs.map(() => '?').join(',');
+        const ipDetailsResult = await env.DB.prepare(
+          `SELECT ip, latency, bandwidth FROM high_quality_ips WHERE ip IN (${placeholders})`
+        ).bind(...allUpdatedIPs).all();
+        
+        if (ipDetailsResult.results) {
+          updatedIPDetails = ipDetailsResult.results.map(r => ({
+            ip: r.ip,
+            latency: r.latency,
+            bandwidth: r.bandwidth
+          }));
+        }
+      } catch (e) {
+        // 如果查询失败，至少返回IP地址
+        updatedIPDetails = allUpdatedIPs.map(ip => ({ ip, latency: 0, bandwidth: 0 }));
+      }
+    }
+    
     return { 
       success: successCount > 0, 
       results, 
       successCount, 
       totalCount: results.length,
-      subrequestCount: subrequestUsed
+      subrequestCount: subrequestUsed,
+      updatedIPs: updatedIPDetails,  // 返回更新的IP详情
+      updatedIPCount: allUpdatedIPs.length
     };
     
   } catch (error) {
     await addSystemLog(env, `❌ DNS更新异常: ${error.message}`);
-    return { success: false, error: error.message };
+    return { success: false, error: error.message, updatedIPs: [], updatedIPCount: 0 };
   }
 }
 
@@ -6492,6 +6522,7 @@ async function updateDNSBatchLimited(env, ips, triggerSource = 'manual', recordN
 
     // 串行创建新记录
     let successCount = 0;
+    const updatedIPs = []; // 记录成功更新的IP
     for (const ip of ips) {
       if (subrequestCount + 1 > maxSubrequests) {
         await addSystemLog(env, `⚠️ DNS更新: 子请求不足，停止创建`);
@@ -6506,7 +6537,10 @@ async function updateDNSBatchLimited(env, ips, triggerSource = 'manual', recordN
         });
         subrequestCount++;
         const result = await createResp.json();
-        if (result.success) successCount++;
+        if (result.success) {
+          successCount++;
+          updatedIPs.push(ip); // 记录成功更新的IP
+        }
         await new Promise(r => setTimeout(r, 100));
       } catch (e) {
         // 忽略创建错误
@@ -6517,7 +6551,7 @@ async function updateDNSBatchLimited(env, ips, triggerSource = 'manual', recordN
       await addSystemLog(env, `✅ DNS更新成功: ${successCount} 个IP (域名: ${targetRecordName}, 消耗子请求: ${subrequestCount})`);
     }
     
-    return { success: successCount > 0, count: successCount, domain: targetRecordName, subrequestCount };
+    return { success: successCount > 0, count: successCount, domain: targetRecordName, subrequestCount, updatedIPs };
   } catch (e) {
     await addSystemLog(env, `❌ DNS更新失败: ${e.message}`);
     return { success: false, error: e.message, count: 0, subrequestCount };
@@ -6601,13 +6635,18 @@ async function scheduled(event, env, ctx) {
       try {
         // 检查是否还有剩余子请求
         if (subrequestCount + 1 <= MAX_SUBREQUESTS) {
+          // 使用DNS实际更新的IP，而不是测速的所有IP
+          const notificationIPs = dnsResult.updatedIPs && dnsResult.updatedIPs.length > 0 
+            ? dnsResult.updatedIPs 
+            : testResult.testedIPs?.slice(0, 5) || [];
+          
           // 使用统一的Telegram通知函数，传入已读取的dnsConfig避免额外子请求
           await sendTelegramNotification(env, {
             message: {
-              ipCount: testResult.successCount,
+              ipCount: dnsResult.updatedIPCount || dnsResult.successCount || 0,  // 显示实际更新到DNS的IP数量
               source: 'Cron定时任务',
               domain: dnsResult.results?.map(r => r.domain || r.country).join(', ') || '未配置',
-              ips: testResult.testedIPs?.slice(0, 5),
+              ips: notificationIPs,  // 显示实际更新到DNS的IP
               stats: testResult.stats
             },
             hideIP: false,
