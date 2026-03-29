@@ -225,14 +225,14 @@ ADMIN_PASSWORD = your_secure_password
 
 ### 可选配置
 
-| 变量名                           | 说明           | 默认值  |
-| ----------------------------- | ------------ | ---- |
-| `DEFAULT_IP_COUNT`            | 默认返回 IP 数量   | `3`  |
-| `DEFAULT_TEST_COUNT`          | 默认测试 IP 数量   | `50` |
-| `DEFAULT_THREAD_COUNT`        | 默认测试线程数      | `10` |
-| `DEFAULT_BANDWIDTH_FILE_SIZE` | 带宽测试文件大小(MB) | `3`  |
-| `FAILED_IP_COOLDOWN_DAYS`     | 失败 IP 冷却天数   | `15` |
-| `MAX_HIGH_QUALITY_POOL_SIZE`  | 最大优质池容量      | `30` |
+| 变量名                           | 说明           | 默认值  | 范围      |
+| ----------------------------- | ------------ | ---- | ------- |
+| `DEFAULT_IP_COUNT`            | 默认返回 IP 数量   | `3`  | 1-10    |
+| `DEFAULT_TEST_COUNT`          | 默认测试 IP 数量   | `30` | 10-100  |
+| `DEFAULT_THREAD_COUNT`        | 默认测试线程数      | `10` | 1-10    |
+| `DEFAULT_BANDWIDTH_FILE_SIZE` | 带宽测试文件大小(MB) | `3`  | 3-10    |
+| `FAILED_IP_COOLDOWN_DAYS`     | 失败 IP 冷却天数   | `15` | 1-30    |
+| `MAX_HIGH_QUALITY_POOL_SIZE`  | 带宽优质池最大容量   | `20` | 10-50   |
 
 ***
 
