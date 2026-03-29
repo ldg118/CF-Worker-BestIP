@@ -6,9 +6,11 @@
   "scripts": {
     "dev": "wrangler dev",
     "dev:pages": "wrangler pages dev .",
+    "dev:pages:functions": "wrangler pages dev . --functions-root=functions",
     "deploy": "wrangler deploy",
     "deploy:pages": "wrangler pages deploy . --project-name=cf-best-ip",
-    "build": "echo 'Build completed'",
+    "deploy:pages:functions": "wrangler pages deploy . --project-name=cf-best-ip --functions-root=functions",
+    "build": "echo 'Build completed',",
     "d1:create": "wrangler d1 create cf-best-ip-db",
     "d1:create:dev": "wrangler d1 create cf-best-ip-db-dev",
     "d1:migrate": "wrangler d1 migrations apply cf-best-ip-db --remote",
