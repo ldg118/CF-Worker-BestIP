@@ -6528,32 +6528,32 @@ async function updateDNSBatchLimited(env, ips, triggerSource = 'manual', recordN
 // Cron定时任务入口 - 单次执行模式，严格控制在50个子请求内
 async function scheduled(event, env, ctx) {
   await addSystemLog(env, `⏰ Cron定时任务启动（严格限制50子请求）`);
-  
+
   // 子请求计数器
   let subrequestCount = 0;
-  const MAX_SUBREQUESTS = 48; // 留2个安全余量
-  
+  const MAX_SUBREQUESTS = 50; // 使用完整50个子请求限制
+
   try {
     // 获取DNS配置，检查是否同时设置了域名记录和国家域名
     const dnsConfig = await env.KV.get(CONFIG.kvKeys.dnsConfig, 'json') || {};
     const hasRecordName = dnsConfig?.recordName;
     const hasCountryDomains = dnsConfig?.countryDomains && Object.keys(dnsConfig.countryDomains).length > 0;
     const hasBothDomains = hasRecordName && hasCountryDomains;
-    
+
     // 计算DNS更新次数和预算
     const DNSUpdatesCount = hasBothDomains ? 2 : 1;
     // DNS预算: 查询1 + 删除最多3 + 创建最多3 + 余量1 = 8个/域名（安全预算）
     const DNS_SUBREQUESTS_PER_DOMAIN = 8;
     const DNS_SUBREQUESTS = DNS_SUBREQUESTS_PER_DOMAIN * DNSUpdatesCount;
     const NOTIFICATION_SUBREQUESTS = 1;
-    
+
     // 计算测速可用预算和最大IP数
     // 每个IP实际消耗2个子请求（延迟+带宽）
     const availableSubrequestsForTest = MAX_SUBREQUESTS - DNS_SUBREQUESTS - NOTIFICATION_SUBREQUESTS;
     const maxTestIPsBySubrequest = Math.floor(availableSubrequestsForTest / 2);
-    // 上限: 单域名20个, 双域名15个（安全设置）
+    // 上限: 单域名21个, 双域名16个（优化设置，配合DNS动态调整）
     const minTestIPs = hasBothDomains ? 8 : 10;
-    const maxTestIPsLimit = hasBothDomains ? 15 : 20;
+    const maxTestIPsLimit = hasBothDomains ? 16 : 21;
     const maxTestIPs = Math.max(minTestIPs, Math.min(maxTestIPsLimit, maxTestIPsBySubrequest));
     
     await addSystemLog(env, `📊 预算分配: 测速最多${maxTestIPs}个IP(预算${availableSubrequestsForTest}个子请求), DNS${DNSUpdatesCount}个域名(预留${DNS_SUBREQUESTS}个), 通知${NOTIFICATION_SUBREQUESTS}个`);
