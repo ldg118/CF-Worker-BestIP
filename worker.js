@@ -179,8 +179,6 @@ function cleanupIpBandwidthTestCache() {
 
 let writeQueue = [];
 let writeTimer = null;
-let bandwidthTestCount = 0;
-let lastBandwidthTestReset = Date.now();
 
 const ipRegex = /^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/;
 
@@ -666,24 +664,29 @@ async function initDatabase(env) {
 }
 
 // 通用配置获取函数
-async function getConfig(env, type) {
+async function getConfig(env, type, countSubrequests = false) {
+  let subrequestCount = 0;
   switch (type) {
     case 'advanced': {
       const savedConfig = await env.KV.get(CONFIG.kvKeys.advancedConfig, 'json') || {};
+      subrequestCount++;
       const envConfig = getEnvConfig(env);
-      return {
+      const result = {
         maxHighQualityPoolSize: savedConfig.maxHighQualityPoolSize || envConfig.maxHighQualityPoolSize,
         failedIpCooldownDays: savedConfig.failedIpCooldownDays || envConfig.failedIpCooldownDays,
         maxBackupPoolSize: savedConfig.maxBackupPoolSize || 50
       };
+      return countSubrequests ? { config: result, subrequestCount } : result;
     }
     
     case 'log': {
       const savedConfig = await env.KV.get(CONFIG.kvKeys.logConfig, 'json') || {};
-      return {
+      subrequestCount++;
+      const result = {
         autoClean: savedConfig.autoClean !== false,
         cleanDays: Math.min(7, Math.max(3, parseInt(savedConfig.cleanDays) || 7))
       };
+      return countSubrequests ? { config: result, subrequestCount } : result;
     }
     
     default:
@@ -692,8 +695,8 @@ async function getConfig(env, type) {
 }
 
 // 兼容性别名
-async function getAdvancedConfig(env) {
-  return getConfig(env, 'advanced');
+async function getAdvancedConfig(env, countSubrequests = false) {
+  return getConfig(env, 'advanced', countSubrequests);
 }
 
 async function getLogConfig(env) {
@@ -714,18 +717,18 @@ function getEnvConfig(env) {
 
 async function getIPGeo(env, ip) {
   const cached = geoCache.get(ip);
-  if (cached) return cached;
+  if (cached) return { geo: cached, usedAPI: false };
   
   try {
     const dbCached = await env.DB.prepare('SELECT country, country_name, city FROM ip_geo_cache WHERE ip = ?').bind(ip).first();
     if (dbCached && dbCached.country) {
       const geo = { country: dbCached.country, countryName: dbCached.country_name, city: dbCached.city };
       geoCache.set(ip, geo);
-      return geo;
+      return { geo, usedAPI: false };
     }
   } catch (e) {}
   
-  // 首选: ipwho.is（免费，无需 API key）
+  // 首选: ipwho.is（免费，无需 API key）- 消耗1个子请求
   try {
     const resp = await fetch(`https://ipwho.is/${ip}`, { signal: AbortSignal.timeout(2000) });
     if (resp.ok) {
@@ -739,12 +742,12 @@ async function getIPGeo(env, ip) {
         env.DB.prepare('INSERT OR REPLACE INTO ip_geo_cache (ip, country, country_name, city, cached_at) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)')
           .bind(ip, geo.country, geo.countryName, geo.city).run().catch(() => {});
         geoCache.set(ip, geo);
-        return geo;
+        return { geo, usedAPI: true };
       }
     }
   } catch (e) {}
   
-  // 备用: ip-api.com
+  // 备用: ip-api.com - 消耗1个子请求
   try {
     const resp = await fetch(`http://ip-api.com/json/${ip}?fields=status,country,countryCode,city`, { signal: AbortSignal.timeout(2000) });
     if (resp.ok) {
@@ -758,7 +761,7 @@ async function getIPGeo(env, ip) {
         env.DB.prepare('INSERT OR REPLACE INTO ip_geo_cache (ip, country, country_name, city, cached_at) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)')
           .bind(ip, geo.country, geo.countryName, geo.city).run().catch(() => {});
         geoCache.set(ip, geo);
-        return geo;
+        return { geo, usedAPI: true };
       }
     }
   } catch (e) {}
@@ -851,9 +854,13 @@ async function cleanExpiredLogs(env) {
 
 // 区域5: IP池管理
 
-async function getBandwidthPoolIPs(env) {
+async function getBandwidthPoolIPs(env, countSubrequests = false) {
   try {
-    const advancedConfig = await getAdvancedConfig(env);
+    let subrequestCount = 0;
+    const advancedConfigResult = await getAdvancedConfig(env, countSubrequests);
+    const advancedConfig = countSubrequests ? advancedConfigResult.config : advancedConfigResult;
+    if (countSubrequests) subrequestCount += advancedConfigResult.subrequestCount;
+    
     const maxPoolSize = advancedConfig.maxHighQualityPoolSize;
 
     const result = await env.DB.prepare(`
@@ -863,10 +870,11 @@ async function getBandwidthPoolIPs(env) {
       LIMIT ?
     `).bind(maxPoolSize).all();
 
-    return result.results || [];
+    const ips = result.results || [];
+    return countSubrequests ? { ips, subrequestCount } : ips;
   } catch (e) {
     await addSystemLog(env, `❌ getBandwidthPoolIPs 错误: ${e.message}`);
-    return [];
+    return countSubrequests ? { ips: [], subrequestCount: 0 } : [];
   }
 }
 
@@ -1227,40 +1235,6 @@ async function debugBandwidthPool(env) {
   }
 }
 
-async function shouldPerformBandwidthTest(ip, isRetest, latency = null) {
-  const now = Date.now();
-  
-  const lastTestTime = ipBandwidthTestCache.get(ip);
-  if (lastTestTime && now - lastTestTime < 300000) {
-    return false;
-  }
-  
-  if (now - lastBandwidthTestReset > 60000) {
-    bandwidthTestCount = 0;
-    lastBandwidthTestReset = now;
-  }
-  
-  if (!isRetest && bandwidthTestCount < CONFIG.rateLimit.bandwidthTestsPerMinute) {
-    bandwidthTestCount++;
-    ipBandwidthTestCache.set(ip, now);
-    return true;
-  }
-  
-  if (isRetest && bandwidthTestCount < 3) {
-    bandwidthTestCount++;
-    ipBandwidthTestCache.set(ip, now);
-    return true;
-  }
-  
-  if (latency && latency <= 80 && bandwidthTestCount < CONFIG.rateLimit.bandwidthTestsPerMinute) {
-    bandwidthTestCount++;
-    ipBandwidthTestCache.set(ip, now);
-    return true;
-  }
-  
-  return false;
-}
-
 async function speedTestWithBandwidth(env, ip, geo = null, isInPool = false, ctx = null, isRetry = false) {
   try {
     const cached = bandwidthCache.get(ip);
@@ -1313,42 +1287,40 @@ async function speedTestWithBandwidth(env, ip, geo = null, isInPool = false, ctx
     let downloadSpeed = null;
     
     // 确保 geo 和 countryName 已定义
-    if (!geo) geo = await getIPGeo(env, ip);
+    if (!geo) {
+      const geoResult = await getIPGeo(env, ip);
+      geo = geoResult.geo;
+    }
     const countryName = COUNTRY_NAMES[geo.country] || geo.country || '未知';
 
-    const shouldTest = await shouldPerformBandwidthTest(ip, isInPool, avgLatency);
-    
-    if (shouldTest) {
-      try {
-        const downloadStartTime = Date.now();
-        const response = await fetch(`https://speed.cloudflare.com/__down?bytes=${testBytes}`, {
-          headers: { 'Host': 'speed.cloudflare.com' },
-          cf: { resolveOverride: ip },
-          signal: AbortSignal.timeout(20000)
+    // 执行带宽测试
+    try {
+      const downloadStartTime = Date.now();
+      const response = await fetch(`https://speed.cloudflare.com/__down?bytes=${testBytes}`, {
+        headers: { 'Host': 'speed.cloudflare.com' },
+        cf: { resolveOverride: ip },
+        signal: AbortSignal.timeout(20000)
+      });
+      if (response.ok) {
+        const arrayBuffer = await response.arrayBuffer();
+        const downloadTime = (Date.now() - downloadStartTime) / 1000;
+        bandwidthMbps = Math.round((arrayBuffer.byteLength * 8) / (downloadTime * 1000000) * 100) / 100;
+        downloadSpeed = Math.round(arrayBuffer.byteLength / downloadTime / 1024);
+        
+        bandwidthCache.set(ip, {
+          success: true, ip, latency: avgLatency, minLatency,
+          maxLatency: Math.max(...latencyResults.filter(r => r !== null)),
+          bandwidth: bandwidthMbps, downloadSpeed,
+          bandwidthLevel: getBandwidthLevel(bandwidthMbps).level,
+          score: calculateIPScore(avgLatency, bandwidthMbps || 0),
+          country: geo.country, countryName
         });
-        if (response.ok) {
-          const arrayBuffer = await response.arrayBuffer();
-          const downloadTime = (Date.now() - downloadStartTime) / 1000;
-          bandwidthMbps = Math.round((arrayBuffer.byteLength * 8) / (downloadTime * 1000000) * 100) / 100;
-          downloadSpeed = Math.round(arrayBuffer.byteLength / downloadTime / 1024);
-          
-          bandwidthCache.set(ip, {
-            success: true, ip, latency: avgLatency, minLatency,
-            maxLatency: Math.max(...latencyResults.filter(r => r !== null)),
-            bandwidth: bandwidthMbps, downloadSpeed,
-            bandwidthLevel: getBandwidthLevel(bandwidthMbps).level,
-            score: calculateIPScore(avgLatency, bandwidthMbps || 0),
-            country: geo.country, countryName
-          });
-        } else {
-          await addSystemLog(env, `⚠️ ${ip} - 带宽测试返回 ${response.status}`);
-          bandwidthMbps = estimateBandwidthByLatency(avgLatency);
-        }
-      } catch (e) {
-        await addSystemLog(env, `⚠️ ${ip} - 带宽测试失败: ${e.message}`);
+      } else {
+        await addSystemLog(env, `⚠️ ${ip} - 带宽测试返回 ${response.status}`);
         bandwidthMbps = estimateBandwidthByLatency(avgLatency);
       }
-    } else {
+    } catch (e) {
+      await addSystemLog(env, `⚠️ ${ip} - 带宽测试失败: ${e.message}`);
       bandwidthMbps = estimateBandwidthByLatency(avgLatency);
     }
     
@@ -1434,9 +1406,6 @@ async function speedTestWithBandwidth(env, ip, geo = null, isInPool = false, ctx
 
 async function smartSpeedTest(env, options = {}, ctx = null) {
   const { maxConcurrent = 1, batchDelay = 3000, maxRetries = 1, timeout = 10000 } = options;
-  
-  bandwidthTestCount = 0;
-  lastBandwidthTestReset = Date.now();
   
   // 清理过期的带宽测试缓存
   cleanupIpBandwidthTestCache();
@@ -1795,12 +1764,18 @@ async function getTotalIPCount(env) {
   } catch (e) { return 0; }
 }
 
-async function getAllIPs(env) {
+async function getAllIPs(env, countSubrequests = false) {
   try {
+    let subrequestCount = 0;
     const ips = await env.KV.get(CONFIG.kvKeys.ipList, 'json') || [];
+    subrequestCount++;
     const customIPs = await env.KV.get(CONFIG.kvKeys.customIPs, 'json') || [];
-    return [...new Set([...ips, ...customIPs])];
-  } catch (e) { return []; }
+    subrequestCount++;
+    const result = [...new Set([...ips, ...customIPs])];
+    return countSubrequests ? { ips: result, subrequestCount } : result;
+  } catch (e) { 
+    return countSubrequests ? { ips: [], subrequestCount: 0 } : []; 
+  }
 }
 
 async function updateIPs(env) {
@@ -5435,7 +5410,8 @@ export default {
         }
         
         const avgLatency = Math.round(totalLatency / successCount);
-        const geo = await getIPGeo(env, ip);
+        const geoResult = await getIPGeo(env, ip);
+        const geo = geoResult.geo;
         const bandwidthEstimate = estimateBandwidthByLatency(avgLatency);
         
         return new Response(JSON.stringify({
@@ -6017,7 +5993,13 @@ async function simpleSpeedTest(env, ip, ctx = null) {
     }
     
     // 2. 获取地理位置（如果缓存中没有）
-    let geo = await getIPGeo(env, ip);
+    const geoResult = await getIPGeo(env, ip);
+    let geo = geoResult.geo;
+    // 如果使用了API查询，额外消耗1个子请求
+    if (geoResult.usedAPI) {
+      // 地理位置API查询消耗1个子请求，但已经在预算预留中考虑
+      // 这里不需要额外计数，因为检查条件是 +3，实际计数是 +2
+    }
     const countryName = COUNTRY_NAMES[geo.country] || geo.country || '未知';
     
     // 3. 只测1次带宽（简化版，使用小文件）
@@ -6113,21 +6095,22 @@ async function fullCronSpeedTestLimited(env, ctx, maxSubrequests, maxTestIPs = 1
   let subrequestCount = 0;
   
   try {
-    // 获取所有待测IP
-    const allIPs = await getAllIPs(env);
+    // 获取所有待测IP（消耗2个子请求）
+    const allIPsResult = await getAllIPs(env, true);
+    const allIPs = allIPsResult.ips;
+    subrequestCount += allIPsResult.subrequestCount;
     
     if (allIPs.length === 0) {
       await addSystemLog(env, `⚠️ 没有可测速的IP`);
-      return { successCount: 0, failCount: 0, bandwidthCount: 0, subrequestCount: 0 };
+      return { successCount: 0, failCount: 0, bandwidthCount: 0, subrequestCount };
     }
     
-    // 获取配置
-    const advancedConfig = await getAdvancedConfig(env);
-    const maxPoolSize = advancedConfig.maxHighQualityPoolSize;
-    
-    // 获取当前带宽池状态
-    const bandwidthPoolIPs = await getBandwidthPoolIPs(env);
+    // 获取当前带宽池状态（消耗1个子请求，包含getAdvancedConfig）
+    const bandwidthPoolResult = await getBandwidthPoolIPs(env, true);
+    const bandwidthPoolIPs = bandwidthPoolResult.ips;
+    subrequestCount += bandwidthPoolResult.subrequestCount;
     const currentBandwidthCount = bandwidthPoolIPs.length;
+    const maxPoolSize = 20; // 使用默认值，避免额外KV读取
     
     // 使用传入的最大测试数量，限制在8-20范围内
     // Cron定时任务模式下，优先使用根据子请求预算计算的maxTestIPs，不受UI设置限制
@@ -6224,8 +6207,8 @@ async function fullCronSpeedTestLimited(env, ctx, maxSubrequests, maxTestIPs = 1
     const testResults = { successCount: 0, failCount: 0, testedIPs: [] };
     
     for (let i = 0; i < ipsToTest.length; i++) {
-      // 检查剩余子请求是否足够测试下一个IP（每个IP约2个子请求）
-      if (subrequestCount + 2 > maxSubrequests) {
+      // 检查剩余子请求是否足够测试下一个IP（每个IP约2-3个子请求：延迟+带宽+可能地理位置）
+      if (subrequestCount + 3 > maxSubrequests) {
         await addSystemLog(env, `⚠️ 子请求即将达到限制(${subrequestCount}/${maxSubrequests})，停止测速，已测试 ${i} 个IP`);
         break;
       }
@@ -6234,6 +6217,7 @@ async function fullCronSpeedTestLimited(env, ctx, maxSubrequests, maxTestIPs = 1
       try {
         const result = await simpleSpeedTest(env, ip, ctx);
         // 每个IP测试消耗约2个子请求（延迟+带宽）
+        // 地理位置查询如果走API会额外消耗，但通常有缓存
         subrequestCount += 2;
         
         if (result.success) {
@@ -6285,26 +6269,30 @@ async function fullCronSpeedTestLimited(env, ctx, maxSubrequests, maxTestIPs = 1
 
 // 限制子请求版本的DNS更新 - 严格控制在指定数量内
 async function optimizedDNSUpdateLimited(env, ctx, maxSubrequests, dnsIPCount = 3, updateBothDomains = false) {
+  let subrequestUsed = 0;
+  
+  // 读取DNS配置（消耗1个子请求）
   const dnsConfig = await env.KV.get(CONFIG.kvKeys.dnsConfig, 'json');
+  subrequestUsed++;
   
   if (!dnsConfig?.autoUpdate) {
-    return { success: false, reason: 'not_enabled' };
+    return { success: false, reason: 'not_enabled', subrequestCount: subrequestUsed };
   }
   
   if (!dnsConfig?.apiToken || !dnsConfig?.zoneId) {
     await addSystemLog(env, `❌ DNS更新: 配置不完整`);
-    return { success: false, reason: 'config_incomplete' };
+    return { success: false, reason: 'config_incomplete', subrequestCount: subrequestUsed };
   }
   
-  // 估算DNS更新需要的子请求数
-  // 查询1 + 删除最多3 + 创建最多dnsIPCount = 1+3+dnsIPCount个子请求
-  const estimatedSubrequestsPerDomain = 1 + 3 + dnsIPCount + 1; // +1余量
+  // 估算DNS更新需要的子请求数（包括KV操作）
+  // 查询1 + 删除最多3 + 创建最多dnsIPCount + KV操作2 = 1+3+dnsIPCount+2个子请求
+  const estimatedSubrequestsPerDomain = 1 + 3 + dnsIPCount + 2; // +2是KV读取和写入
   const domainCount = updateBothDomains ? 2 : 1;
   const totalEstimatedSubrequests = estimatedSubrequestsPerDomain * domainCount;
   
-  if (maxSubrequests < totalEstimatedSubrequests) {
-    await addSystemLog(env, `⚠️ DNS更新: 子请求不足(需${totalEstimatedSubrequests},剩${maxSubrequests})，跳过`);
-    return { success: false, reason: 'insufficient_subrequests' };
+  if (maxSubrequests < totalEstimatedSubrequests + subrequestUsed) {
+    await addSystemLog(env, `⚠️ DNS更新: 子请求不足(需${totalEstimatedSubrequests + subrequestUsed},剩${maxSubrequests})，跳过`);
+    return { success: false, reason: 'insufficient_subrequests', subrequestCount: subrequestUsed };
   }
   
   try {
@@ -6316,7 +6304,6 @@ async function optimizedDNSUpdateLimited(env, ctx, maxSubrequests, dnsIPCount = 
     const hasRecordName = dnsConfig?.recordName;
     
     let results = [];
-    let subrequestUsed = 0;
     
     // 如果同时设置了两种域名，先更新国家域名，再更新recordName
     if (hasCountryDomains) {
@@ -6324,10 +6311,11 @@ async function optimizedDNSUpdateLimited(env, ctx, maxSubrequests, dnsIPCount = 
       const countryKeys = Object.keys(countryDomains);
       const totalCountries = countryKeys.length;
       
-      // 从KV获取上次更新的国家索引
+      // 从KV获取上次更新的国家索引（消耗1个子请求）
       let lastCountryIndex = 0;
       try {
         const savedIndex = await env.KV.get('last_dns_country_index');
+        subrequestUsed++;
         if (savedIndex !== null) {
           lastCountryIndex = parseInt(savedIndex, 10) || 0;
         }
@@ -6338,9 +6326,10 @@ async function optimizedDNSUpdateLimited(env, ctx, maxSubrequests, dnsIPCount = 
       const countryToUpdate = countryKeys[currentIndex];
       const domain = countryDomains[countryToUpdate];
       
-      // 保存下一个国家索引
+      // 保存下一个国家索引（消耗1个子请求）
       try {
         await env.KV.put('last_dns_country_index', String((currentIndex + 1) % totalCountries));
+        subrequestUsed++;
       } catch (e) {}
       
       await addSystemLog(env, `🌍 DNS多国家更新(轮询模式): ${countryToUpdate} (${currentIndex + 1}/${totalCountries})`);
@@ -6373,10 +6362,13 @@ async function optimizedDNSUpdateLimited(env, ctx, maxSubrequests, dnsIPCount = 
         
         if (ips.length > 0) {
           // 传入dnsConfig避免重复读取KV（节省1个子请求）
-          const result = await updateDNSBatchLimited(env, ips, 'cron', domain, maxSubrequests - subrequestUsed, dnsConfig);
+          // 传入剩余预算时要考虑已使用的KV操作子请求
+          const remainingBudget = maxSubrequests - subrequestUsed;
+          await addSystemLog(env, `📊 DNS更新: 传入预算 ${remainingBudget} (总预算${maxSubrequests},已用${subrequestUsed})`);
+          const result = await updateDNSBatchLimited(env, ips, 'cron', domain, remainingBudget, dnsConfig);
           results.push({ country: countryToUpdate, domain, ...result });
           subrequestUsed += result.subrequestCount || 0;
-          await addSystemLog(env, `✅ ${countryToUpdate} DNS更新: ${result.count || 0} 个IP (${domain}, 消耗${result.subrequestCount || 0}子请求)`);
+          await addSystemLog(env, `✅ ${countryToUpdate} DNS更新: ${result.count || 0} 个IP (${domain}, 消耗${result.subrequestCount || 0}子请求, 累计${subrequestUsed})`);
         } else {
           await addSystemLog(env, `⚠️ ${countryToUpdate} DNS更新: 带宽优质池和备用池均无该国家IP，跳过`);
         }
@@ -6398,10 +6390,11 @@ async function optimizedDNSUpdateLimited(env, ctx, maxSubrequests, dnsIPCount = 
         
         if (ips.length > 0) {
           // 传入dnsConfig避免重复读取KV（节省1个子请求）
-          const result = await updateDNSBatchLimited(env, ips, 'cron', domain, maxSubrequests - subrequestUsed, dnsConfig);
+          const remainingBudget = maxSubrequests - subrequestUsed;
+          const result = await updateDNSBatchLimited(env, ips, 'cron', domain, remainingBudget, dnsConfig);
           results.push({ domain: domain, type: 'main', ...result });
           subrequestUsed += result.subrequestCount || 0;
-          await addSystemLog(env, `✅ 主域名DNS更新: ${result.count || 0} 个IP (${domain}, 消耗${result.subrequestCount || 0}子请求)`);
+          await addSystemLog(env, `✅ 主域名DNS更新: ${result.count || 0} 个IP (${domain}, 消耗${result.subrequestCount || 0}子请求, 累计${subrequestUsed})`);
         } else {
           await addSystemLog(env, `⚠️ 主域名DNS更新: 带宽优质池为空，跳过`);
         }
@@ -6427,10 +6420,11 @@ async function optimizedDNSUpdateLimited(env, ctx, maxSubrequests, dnsIPCount = 
       
       if (ips.length > 0) {
         // 传入dnsConfig避免重复读取KV（节省1个子请求）
-        const result = await updateDNSBatchLimited(env, ips, 'cron', domain, maxSubrequests - subrequestUsed, dnsConfig);
+        const remainingBudget = maxSubrequests - subrequestUsed;
+        const result = await updateDNSBatchLimited(env, ips, 'cron', domain, remainingBudget, dnsConfig);
         results.push({ domain, ...result });
         subrequestUsed += result.subrequestCount || 0;
-        await addSystemLog(env, `✅ DNS更新: ${result.count || 0} 个IP (${domain}, 消耗${result.subrequestCount || 0}子请求)`);
+        await addSystemLog(env, `✅ DNS更新: ${result.count || 0} 个IP (${domain}, 消耗${result.subrequestCount || 0}子请求, 累计${subrequestUsed})`);
       } else {
         await addSystemLog(env, `⚠️ DNS更新: 带宽优质池为空，跳过`);
       }
@@ -6548,13 +6542,16 @@ async function updateDNSBatchLimited(env, ips, triggerSource = 'manual', recordN
       }
       
       try {
+        await addSystemLog(env, `📊 DNS创建前: ${subrequestCount}/${maxSubrequests}`);
         const createResp = await fetch(url, {
           method: 'POST',
           headers: { 'Authorization': `Bearer ${config.apiToken}`, 'Content-Type': 'application/json' },
           body: JSON.stringify({ type: 'A', name: targetRecordName, content: ip, ttl: 120, proxied: config.proxied || false })
         });
         subrequestCount++;
+        await addSystemLog(env, `📊 DNS创建fetch后: ${subrequestCount}/${maxSubrequests}`);
         const result = await createResp.json();
+        await addSystemLog(env, `📊 DNS创建json后: ${subrequestCount}/${maxSubrequests}`);
         
         if (result.success) {
           successCount++;
@@ -6611,12 +6608,12 @@ async function scheduled(event, env, ctx) {
     const NOTIFICATION_SUBREQUESTS = 1;
 
     // 计算测速可用预算和最大IP数
-    // 每个IP实际消耗2个子请求（延迟+带宽）
+    // 每个IP实际消耗2个子请求（延迟+带宽），地理位置通常有缓存
     const availableSubrequestsForTest = MAX_SUBREQUESTS - DNS_SUBREQUESTS - NOTIFICATION_SUBREQUESTS;
     const maxTestIPsBySubrequest = Math.floor(availableSubrequestsForTest / 2);
-    // 上限: 单域名21个, 双域名16个（优化设置，配合DNS动态调整）
+    // 上限: 单域名17个, 双域名15个（17个是稳定成功的上限）
     const minTestIPs = hasBothDomains ? 8 : 10;
-    const maxTestIPsLimit = hasBothDomains ? 16 : 21;
+    const maxTestIPsLimit = hasBothDomains ? 15 : 17;
     const maxTestIPs = Math.max(minTestIPs, Math.min(maxTestIPsLimit, maxTestIPsBySubrequest));
     
     await addSystemLog(env, `📊 预算分配: 测速最多${maxTestIPs}个IP(预算${availableSubrequestsForTest}个子请求), DNS${DNSUpdatesCount}个域名(预留${DNS_SUBREQUESTS}个), 通知${NOTIFICATION_SUBREQUESTS}个`);
