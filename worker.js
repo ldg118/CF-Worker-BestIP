@@ -6372,10 +6372,11 @@ async function optimizedDNSUpdateLimited(env, ctx, maxSubrequests, dnsIPCount = 
         const ips = filteredIPs.slice(0, ipCount).map(r => r.ip);
         
         if (ips.length > 0) {
-          const result = await updateDNSBatchLimited(env, ips, 'cron', domain, maxSubrequests - subrequestUsed);
+          // 传入dnsConfig避免重复读取KV（节省1个子请求）
+          const result = await updateDNSBatchLimited(env, ips, 'cron', domain, maxSubrequests - subrequestUsed, dnsConfig);
           results.push({ country: countryToUpdate, domain, ...result });
           subrequestUsed += result.subrequestCount || 0;
-          await addSystemLog(env, `✅ ${countryToUpdate} DNS更新: ${result.count || 0} 个IP (${domain})`);
+          await addSystemLog(env, `✅ ${countryToUpdate} DNS更新: ${result.count || 0} 个IP (${domain}, 消耗${result.subrequestCount || 0}子请求)`);
         } else {
           await addSystemLog(env, `⚠️ ${countryToUpdate} DNS更新: 带宽优质池和备用池均无该国家IP，跳过`);
         }
@@ -6396,10 +6397,11 @@ async function optimizedDNSUpdateLimited(env, ctx, maxSubrequests, dnsIPCount = 
         const ips = bandwidthPoolIPs.slice(0, ipCount).map(r => r.ip);
         
         if (ips.length > 0) {
-          const result = await updateDNSBatchLimited(env, ips, 'cron', domain, maxSubrequests - subrequestUsed);
+          // 传入dnsConfig避免重复读取KV（节省1个子请求）
+          const result = await updateDNSBatchLimited(env, ips, 'cron', domain, maxSubrequests - subrequestUsed, dnsConfig);
           results.push({ domain: domain, type: 'main', ...result });
           subrequestUsed += result.subrequestCount || 0;
-          await addSystemLog(env, `✅ 主域名DNS更新: ${result.count || 0} 个IP (${domain})`);
+          await addSystemLog(env, `✅ 主域名DNS更新: ${result.count || 0} 个IP (${domain}, 消耗${result.subrequestCount || 0}子请求)`);
         } else {
           await addSystemLog(env, `⚠️ 主域名DNS更新: 带宽优质池为空，跳过`);
         }
@@ -6424,10 +6426,11 @@ async function optimizedDNSUpdateLimited(env, ctx, maxSubrequests, dnsIPCount = 
       const ips = bandwidthPoolIPs.slice(0, ipCount).map(r => r.ip);
       
       if (ips.length > 0) {
-        const result = await updateDNSBatchLimited(env, ips, 'cron', domain, maxSubrequests - subrequestUsed);
+        // 传入dnsConfig避免重复读取KV（节省1个子请求）
+        const result = await updateDNSBatchLimited(env, ips, 'cron', domain, maxSubrequests - subrequestUsed, dnsConfig);
         results.push({ domain, ...result });
         subrequestUsed += result.subrequestCount || 0;
-        await addSystemLog(env, `✅ DNS更新: ${result.count || 0} 个IP (${domain})`);
+        await addSystemLog(env, `✅ DNS更新: ${result.count || 0} 个IP (${domain}, 消耗${result.subrequestCount || 0}子请求)`);
       } else {
         await addSystemLog(env, `⚠️ DNS更新: 带宽优质池为空，跳过`);
       }
@@ -6479,12 +6482,13 @@ async function optimizedDNSUpdateLimited(env, ctx, maxSubrequests, dnsIPCount = 
 }
 
 // 限制子请求版本的DNS批量更新
-async function updateDNSBatchLimited(env, ips, triggerSource = 'manual', recordName = null, maxSubrequests = 10) {
+async function updateDNSBatchLimited(env, ips, triggerSource = 'manual', recordName = null, maxSubrequests = 10, dnsConfig = null) {
   let subrequestCount = 0;
   
   try {
-    const dnsConfig = await env.KV.get(CONFIG.kvKeys.dnsConfig, 'json');
-    if (!dnsConfig || !dnsConfig.apiToken || !dnsConfig.zoneId) {
+    // 如果未传入dnsConfig，则从KV读取（消耗1个子请求）
+    const config = dnsConfig || await env.KV.get(CONFIG.kvKeys.dnsConfig, 'json');
+    if (!config || !config.apiToken || !config.zoneId) {
       return { success: false, error: 'DNS配置不完整', subrequestCount };
     }
 
@@ -6492,13 +6496,13 @@ async function updateDNSBatchLimited(env, ips, triggerSource = 'manual', recordN
       return { success: false, error: '没有可用的IP地址', subrequestCount };
     }
 
-    const targetRecordName = recordName || dnsConfig.recordName;
+    const targetRecordName = recordName || config.recordName;
     if (!targetRecordName) {
       return { success: false, error: '域名未配置', subrequestCount };
     }
 
     // 使用传入的ips数组（调用者已控制长度）
-    const url = `https://api.cloudflare.com/client/v4/zones/${dnsConfig.zoneId}/dns_records`;
+    const url = `https://api.cloudflare.com/client/v4/zones/${config.zoneId}/dns_records`;
 
     // 获取现有DNS记录列表 (1个子请求)
     if (subrequestCount + 1 > maxSubrequests) {
@@ -6506,7 +6510,7 @@ async function updateDNSBatchLimited(env, ips, triggerSource = 'manual', recordN
     }
     
     const listResp = await fetch(`${url}?type=A&name=${targetRecordName}`, {
-      headers: { 'Authorization': `Bearer ${dnsConfig.apiToken}` }
+      headers: { 'Authorization': `Bearer ${config.apiToken}` }
     });
     subrequestCount++;
     const listData = await listResp.json();
@@ -6522,7 +6526,7 @@ async function updateDNSBatchLimited(env, ips, triggerSource = 'manual', recordN
         try {
           await fetch(`${url}/${record.id}`, { 
             method: 'DELETE', 
-            headers: { 'Authorization': `Bearer ${dnsConfig.apiToken}` } 
+            headers: { 'Authorization': `Bearer ${config.apiToken}` } 
           });
           subrequestCount++;
           await new Promise(r => setTimeout(r, 100));
@@ -6544,8 +6548,8 @@ async function updateDNSBatchLimited(env, ips, triggerSource = 'manual', recordN
       try {
         const createResp = await fetch(url, {
           method: 'POST',
-          headers: { 'Authorization': `Bearer ${dnsConfig.apiToken}`, 'Content-Type': 'application/json' },
-          body: JSON.stringify({ type: 'A', name: targetRecordName, content: ip, ttl: 120, proxied: dnsConfig.proxied || false })
+          headers: { 'Authorization': `Bearer ${config.apiToken}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ type: 'A', name: targetRecordName, content: ip, ttl: 120, proxied: config.proxied || false })
         });
         subrequestCount++;
         const result = await createResp.json();
@@ -6638,10 +6642,10 @@ async function scheduled(event, env, ctx) {
       await new Promise(r => setTimeout(r, 2000));
       const dnsResult = await optimizedDNSUpdateLimited(env, ctx, remainingSubrequests, dnsIPCount, hasBothDomains);
       
-      // 更新子请求计数
-      if (dnsResult.subrequestCount) {
-        subrequestCount += dnsResult.subrequestCount;
-      }
+      // 更新子请求计数（包含DNS更新阶段的所有子请求）
+      const dnsSubrequests = dnsResult.subrequestCount || 0;
+      subrequestCount += dnsSubrequests;
+      await addSystemLog(env, `📊 DNS更新阶段消耗 ${dnsSubrequests} 个子请求，累计 ${subrequestCount} 个，剩余 ${MAX_SUBREQUESTS - subrequestCount} 个`);
       
       // 步骤3: 发送Telegram通知（1个子请求：直接使用已读取的dnsConfig，避免重复读取KV）
       try {
@@ -6666,6 +6670,7 @@ async function scheduled(event, env, ctx) {
             dnsConfig: dnsConfig  // 传入已读取的配置，避免重复读取KV
           });
           subrequestCount++;
+          await addSystemLog(env, `📊 通知阶段消耗 1 个子请求，累计 ${subrequestCount} 个，剩余 ${MAX_SUBREQUESTS - subrequestCount} 个`);
         } else {
           await addSystemLog(env, `⚠️ 子请求不足，跳过Telegram通知`);
         }
