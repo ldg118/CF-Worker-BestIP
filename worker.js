@@ -468,17 +468,18 @@ function addToWriteQueue(env, stmt) {
   }
 }
 
-async function sendTelegramNotification(env, { message, hideIP = true, type = 'info' }) {
-  const dnsConfig = await env.KV.get(CONFIG.kvKeys.dnsConfig, 'json') || {};
-  
-  if (!dnsConfig.telegramEnabled) {
+async function sendTelegramNotification(env, { message, hideIP = true, type = 'info', dnsConfig = null }) {
+  // 如果未传入dnsConfig，则从KV读取（消耗1个子请求）
+  const config = dnsConfig || await env.KV.get(CONFIG.kvKeys.dnsConfig, 'json') || {};
+
+  if (!config.telegramEnabled) {
     await addSystemLog(env, `ℹ️ Telegram通知未启用`);
     return;
   }
-  
-  const botToken = dnsConfig.telegramBotToken;
-  const chatId = dnsConfig.telegramChatId;
-  
+
+  const botToken = config.telegramBotToken;
+  const chatId = config.telegramChatId;
+
   if (!botToken || !chatId) {
     await addSystemLog(env, `ℹ️ Telegram配置不完整`);
     return;
@@ -6596,11 +6597,11 @@ async function scheduled(event, env, ctx) {
         subrequestCount += dnsResult.subrequestCount;
       }
       
-      // 步骤3: 发送Telegram通知（1个子请求）
+      // 步骤3: 发送Telegram通知（1个子请求：直接使用已读取的dnsConfig，避免重复读取KV）
       try {
         // 检查是否还有剩余子请求
         if (subrequestCount + 1 <= MAX_SUBREQUESTS) {
-          // 使用统一的Telegram通知函数，直接使用测速返回的数据
+          // 使用统一的Telegram通知函数，传入已读取的dnsConfig避免额外子请求
           await sendTelegramNotification(env, {
             message: {
               ipCount: testResult.successCount,
@@ -6610,7 +6611,8 @@ async function scheduled(event, env, ctx) {
               stats: testResult.stats
             },
             hideIP: false,
-            type: dnsResult.success ? 'success' : 'warning'
+            type: dnsResult.success ? 'success' : 'warning',
+            dnsConfig: dnsConfig  // 传入已读取的配置，避免重复读取KV
           });
           subrequestCount++;
         } else {
