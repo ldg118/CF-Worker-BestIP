@@ -6347,21 +6347,22 @@ async function optimizedDNSUpdateLimited(env, ctx, maxSubrequests, dnsIPCount = 
       
       // 检查剩余子请求
       if (subrequestUsed + 7 <= maxSubrequests) {
-        // 直接从数据库获取最佳IP
-        const bestIPs = await env.DB.prepare(`
-          SELECT ip FROM high_quality_ips 
-          WHERE country = ? OR country = 'unknown'
-          ORDER BY bandwidth DESC, latency ASC 
-          LIMIT ?
-        `).bind(countryToUpdate, ipCount).all();
-        
-        const ips = (bestIPs.results || []).map(r => r.ip);
+        // 从带宽优质池获取最佳IP（优先使用优质池）
+        const bandwidthPoolIPs = await getBandwidthPoolIPs(env);
+        // 筛选符合国家的IP，如果没有则使用全部优质池IP
+        let filteredIPs = bandwidthPoolIPs.filter(ip => ip.country === countryToUpdate || ip.country === 'unknown');
+        if (filteredIPs.length === 0) {
+          filteredIPs = bandwidthPoolIPs; // 如果没有该国家的IP，使用全部优质池
+        }
+        const ips = filteredIPs.slice(0, ipCount).map(r => r.ip);
         
         if (ips.length > 0) {
           const result = await updateDNSBatchLimited(env, ips, 'cron', domain, maxSubrequests - subrequestUsed);
           results.push({ country: countryToUpdate, domain, ...result });
           subrequestUsed += result.subrequestCount || 0;
           await addSystemLog(env, `✅ ${countryToUpdate} DNS更新: ${result.count || 0} 个IP (${domain})`);
+        } else {
+          await addSystemLog(env, `⚠️ ${countryToUpdate} DNS更新: 带宽优质池为空，跳过`);
         }
       } else {
         await addSystemLog(env, `⚠️ DNS更新: 子请求即将耗尽，跳过国家域名更新`);
@@ -6375,19 +6376,17 @@ async function optimizedDNSUpdateLimited(env, ctx, maxSubrequests, dnsIPCount = 
       
       // 检查剩余子请求
       if (subrequestUsed + 7 <= maxSubrequests) {
-        const bestIPs = await env.DB.prepare(`
-          SELECT ip FROM high_quality_ips 
-          ORDER BY bandwidth DESC, latency ASC 
-          LIMIT ?
-        `).bind(ipCount).all();
-        
-        const ips = (bestIPs.results || []).map(r => r.ip);
+        // 从带宽优质池获取最佳IP
+        const bandwidthPoolIPs = await getBandwidthPoolIPs(env);
+        const ips = bandwidthPoolIPs.slice(0, ipCount).map(r => r.ip);
         
         if (ips.length > 0) {
           const result = await updateDNSBatchLimited(env, ips, 'cron', domain, maxSubrequests - subrequestUsed);
           results.push({ domain: domain, type: 'main', ...result });
           subrequestUsed += result.subrequestCount || 0;
           await addSystemLog(env, `✅ 主域名DNS更新: ${result.count || 0} 个IP (${domain})`);
+        } else {
+          await addSystemLog(env, `⚠️ 主域名DNS更新: 带宽优质池为空，跳过`);
         }
       } else {
         await addSystemLog(env, `⚠️ DNS更新: 子请求即将耗尽，跳过主域名更新`);
@@ -6405,19 +6404,17 @@ async function optimizedDNSUpdateLimited(env, ctx, maxSubrequests, dnsIPCount = 
         return { success: false, reason: 'insufficient_subrequests', subrequestCount: subrequestUsed };
       }
       
-      const bestIPs = await env.DB.prepare(`
-        SELECT ip FROM high_quality_ips 
-        ORDER BY bandwidth DESC, latency ASC 
-        LIMIT ?
-      `).bind(ipCount).all();
-      
-      const ips = (bestIPs.results || []).map(r => r.ip);
+      // 从带宽优质池获取最佳IP
+      const bandwidthPoolIPs = await getBandwidthPoolIPs(env);
+      const ips = bandwidthPoolIPs.slice(0, ipCount).map(r => r.ip);
       
       if (ips.length > 0) {
         const result = await updateDNSBatchLimited(env, ips, 'cron', domain, maxSubrequests - subrequestUsed);
         results.push({ domain, ...result });
         subrequestUsed += result.subrequestCount || 0;
         await addSystemLog(env, `✅ DNS更新: ${result.count || 0} 个IP (${domain})`);
+      } else {
+        await addSystemLog(env, `⚠️ DNS更新: 带宽优质池为空，跳过`);
       }
     }
     
