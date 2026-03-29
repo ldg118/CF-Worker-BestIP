@@ -1,10 +1,10 @@
-// Cloudflare Worker 优选IP可视化面板 - 双池智能优化版
-// 版本: v4.6.2 
-// 项目地址: https://github.com/ldg118/CF-Worker-BestIP
+// CF优选IP v4.6.2 | github.com/ldg118/CF-Worker-BestIP
+// 区域1: 全局常量与配置
 
 const VERSION = 'v4.6.2';
 const GITHUB_URL = 'https://github.com/ldg118/CF-Worker-BestIP';
 
+// 核心配置
 const CONFIG = {
   defaultSources: [
     'https://raw.githubusercontent.com/ldg118/CF-Worker-BestIP/refs/heads/main/cfv4'
@@ -132,6 +132,8 @@ CREATE INDEX IF NOT EXISTS idx_high_quality_type ON high_quality_ips(quality_typ
 CREATE INDEX IF NOT EXISTS idx_speed_results_country ON speed_results(country);
 `;
 
+// 区域3: 缓存管理
+
 class SimpleCache {
   constructor(ttl = 30000, maxSize = 100) {
     this.cache = new Map();
@@ -190,6 +192,8 @@ function isValidCIDR(cidr) {
   const mask = parseInt(parts[1], 10);
   return isValidIPv4(parts[0]) && !isNaN(mask) && mask >= 16 && mask <= 30;
 }
+
+// 区域2: IP处理工具函数
 
 function expandCIDR(cidr) {
   try {
@@ -646,6 +650,8 @@ async function getSystemLogs(env) {
   return LogManager.get(env);
 }
 
+// 区域4: 数据库操作
+
 async function initDatabase(env) {
   try {
     const statements = INIT_SQL.split(';').filter(s => s.trim());
@@ -841,6 +847,8 @@ async function cleanExpiredLogs(env) {
     condition: () => logConfig.autoClean
   });
 }
+
+// 区域5: IP池管理
 
 async function getBandwidthPoolIPs(env) {
   try {
@@ -2469,6 +2477,8 @@ async function checkBandwidthReliability(env) {
     return { reliable: abnormalRate < 80, rate: abnormalRate.toFixed(1) };
   } catch (e) { return { reliable: true, rate: 0 }; }
 }
+
+// 区域10: 前端界面
 
 function getLoginHTML() {
   return `<!DOCTYPE html>
@@ -5330,6 +5340,8 @@ function getSettingsHTML(env) {
 </html>`;
 }
 
+// 区域9: 主入口与API路由
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -5977,72 +5989,7 @@ export default {
   }
 };
 
-// Cron任务状态管理 - 支持跨多次执行的分批测速
-const CRON_STATE_KEY = 'cron_task_state';
-
-async function getCronState(env) {
-  try {
-    const state = await env.KV.get(CRON_STATE_KEY, 'json');
-    return state || { 
-      lastRun: 0, 
-      isRunning: false,
-      phase: 'idle', // idle, selecting_ips, testing, dns_update, completed
-      // 分批测速相关
-      totalIPsToTest: 0,      // 总共需要测试的IP数
-      testedIPs: [],          // 已测试的IP列表
-      remainingIPs: [],       // 剩余待测试的IP列表
-      testResults: {          // 累计测试结果
-        successCount: 0,
-        failCount: 0,
-        testedIPs: []
-      },
-      // 任务批次信息
-      currentBatch: 0,        // 当前批次
-      totalBatches: 0,        // 总批次数
-      // DNS更新相关
-      dnsUpdated: false,      // DNS是否已更新
-      // 任务开始时间
-      taskStartTime: 0
-    };
-  } catch (e) {
-    return { 
-      lastRun: 0, 
-      isRunning: false,
-      phase: 'idle',
-      totalIPsToTest: 0,
-      testedIPs: [],
-      remainingIPs: [],
-      testResults: { successCount: 0, failCount: 0, testedIPs: [] },
-      currentBatch: 0,
-      totalBatches: 0,
-      dnsUpdated: false,
-      taskStartTime: 0
-    };
-  }
-}
-
-async function saveCronState(env, state) {
-  await env.KV.put(CRON_STATE_KEY, JSON.stringify(state));
-}
-
-// 重置Cron任务状态（新任务开始时调用）
-async function resetCronState(env) {
-  const newState = { 
-    lastRun: Date.now(), 
-    isRunning: true,
-    phase: 'selecting_ips',
-    totalIPsToTest: 0,
-    testedIPs: [],
-    remainingIPs: [],
-    testResults: { successCount: 0, failCount: 0, testedIPs: [] },
-    currentBatch: 0,
-    totalBatches: 0,
-    dnsUpdated: false,
-    taskStartTime: Date.now()
-  };
-  await saveCronState(env, newState);
-  return newState;
-}
+// 区域6: 测速功能
 
 // 简化的测速函数（Cron专用）- 只测1次延迟 + 1次带宽
 async function simpleSpeedTest(env, ip, ctx = null) {
@@ -6174,8 +6121,6 @@ async function fullCronSpeedTestLimited(env, ctx, maxSubrequests, maxTestIPs = 1
     }
     
     // 获取配置
-    const config = getEnvConfig(env);
-    const uiConfig = await env.KV.get(CONFIG.kvKeys.uiConfig, 'json') || {};
     const advancedConfig = await getAdvancedConfig(env);
     const maxPoolSize = advancedConfig.maxHighQualityPoolSize;
     
@@ -6184,7 +6129,8 @@ async function fullCronSpeedTestLimited(env, ctx, maxSubrequests, maxTestIPs = 1
     const currentBandwidthCount = bandwidthPoolIPs.length;
     
     // 使用传入的最大测试数量，限制在8-20范围内
-    const finalTestCount = Math.max(8, Math.min(maxTestIPs, uiConfig.testCount || config.defaultTestCount, 20));
+    // Cron定时任务模式下，优先使用根据子请求预算计算的maxTestIPs，不受UI设置限制
+    const finalTestCount = Math.max(8, Math.min(maxTestIPs, 20));
     
     // 记录带宽池状态
     if (currentBandwidthCount >= maxPoolSize * 0.9) {
@@ -6220,27 +6166,22 @@ async function fullCronSpeedTestLimited(env, ctx, maxSubrequests, maxTestIPs = 1
     const backupPoolSet = new Set(backupPoolIPList);
     const newIPs = allIPs.filter(ip => !existingIPs.has(ip) && !backupPoolSet.has(ip));
     
-    // 4. 获取可恢复的失败IP
-    const recoverableFailedIPs = await env.DB.prepare(`
-      SELECT f.ip 
-      FROM failed_ips f
-      LEFT JOIN high_quality_ips h ON f.ip = h.ip
-      LEFT JOIN backup_quality_ips b ON f.ip = b.ip
-      WHERE julianday('now') - julianday(f.failed_at) > ?
-      AND h.ip IS NULL AND b.ip IS NULL
-      ORDER BY f.failed_at ASC
-      LIMIT 20
-    `).bind(advancedConfig.failedIpCooldownDays || 7).all();
-    const recoverableIPs = (recoverableFailedIPs.results || []).map(item => item.ip);
-    
-    // 智能分配测试名额
-    const testSlots = {
-      newIPs: Math.floor(finalTestCount * 0.4),
-      highBandwidthNewIPs: Math.floor(finalTestCount * 0.25),
-      bandwidthPoolIPs: Math.floor(finalTestCount * 0.15),
-      backupPoolIPs: Math.floor(finalTestCount * 0.15),
-      recoverableIPs: Math.floor(finalTestCount * 0.05)
+    // 智能分配测试名额（去掉失败池，比例重新分配）
+    // 新IP: 45% | 高带宽新IP: 30% | 带宽池: 15% | 备用池: 10%
+    // 使用Math.round确保能填满finalTestCount
+    let testSlots = {
+      newIPs: Math.round(finalTestCount * 0.45),
+      highBandwidthNewIPs: Math.round(finalTestCount * 0.30),
+      bandwidthPoolIPs: Math.round(finalTestCount * 0.15),
+      backupPoolIPs: Math.round(finalTestCount * 0.10)
     };
+    
+    // 调整配额确保总和等于finalTestCount（单域名模式下子请求充足）
+    const totalSlots = testSlots.newIPs + testSlots.highBandwidthNewIPs + testSlots.bandwidthPoolIPs + testSlots.backupPoolIPs;
+    if (totalSlots < finalTestCount) {
+      // 将差额分配给新IP（优先探索新IP）
+      testSlots.newIPs += (finalTestCount - totalSlots);
+    }
     
     // 构建测试队列
     let ipsToTest = [];
@@ -6268,24 +6209,15 @@ async function fullCronSpeedTestLimited(env, ctx, maxSubrequests, maxTestIPs = 1
       ipsToTest.push(...sampled);
     }
     
-    if (recoverableIPs.length > 0) {
-      const sampled = shuffleArray(recoverableIPs).slice(0, testSlots.recoverableIPs);
-      ipsToTest.push(...sampled);
-      if (sampled.length > 0) {
-        await addSystemLog(env, `🔄 失败池自动恢复: ${sampled.length} 个IP`);
-      }
-    }
-    
     // 去重并限制数量
     ipsToTest = [...new Set(ipsToTest)].slice(0, finalTestCount);
     ipsToTest = shuffleArray(ipsToTest);
     
-    await addSystemLog(env, `📊 Cron智能测速: 测试 ${ipsToTest.length} 个IP（限制15个） ` +
+    await addSystemLog(env, `📊 Cron智能测速: 测试 ${ipsToTest.length}/${finalTestCount} 个IP ` +
       `(新IP:${Math.min(newIPs.length, testSlots.newIPs)}, ` +
       `高带宽:${Math.min(highBandwidthNewIPs.length, testSlots.highBandwidthNewIPs)}, ` +
       `带宽池:${Math.min(bandwidthPoolIPs.length, testSlots.bandwidthPoolIPs)}, ` +
-      `备用池:${Math.min(backupPoolIPList.length, testSlots.backupPoolIPs)}, ` +
-      `恢复:${Math.min(recoverableIPs.length, testSlots.recoverableIPs)})`);
+      `备用池:${Math.min(backupPoolIPList.length, testSlots.backupPoolIPs)})`);
     
     // 执行测速（串行执行，用实际子请求数控制）
     const testResults = { successCount: 0, failCount: 0, testedIPs: [] };
@@ -6323,18 +6255,32 @@ async function fullCronSpeedTestLimited(env, ctx, maxSubrequests, maxTestIPs = 1
     
     await addSystemLog(env, `✅ Cron测速完成: 成功 ${testResults.successCount}, 失败 ${testResults.failCount}, 消耗 ${subrequestCount} 个子请求`);
     
+    // 计算统计数据
+    const testedIPs = testResults.testedIPs;
+    const avgLatency = testedIPs.length ? 
+      Math.round(testedIPs.reduce((a, b) => a + b.latency, 0) / testedIPs.length) : 0;
+    const avgBandwidth = testedIPs.length ? 
+      Math.round(testedIPs.reduce((a, b) => a + (b.bandwidth || 0), 0) / testedIPs.length) : 0;
+    
     return {
       successCount: testResults.successCount,
       failCount: testResults.failCount,
-      bandwidthCount: testResults.testedIPs.filter(ip => (ip.bandwidth || 0) >= 100).length,
-      subrequestCount: subrequestCount
+      bandwidthCount: testedIPs.filter(ip => (ip.bandwidth || 0) >= 100).length,
+      subrequestCount: subrequestCount,
+      testedIPs: testedIPs,
+      stats: {
+        avgLatency: avgLatency,
+        avgBandwidth: avgBandwidth
+      }
     };
     
   } catch (error) {
     await addSystemLog(env, `❌ Cron测速异常: ${error.message}`);
-    return { successCount: 0, failCount: 0, bandwidthCount: 0, subrequestCount: subrequestCount };
+    return { successCount: 0, failCount: 0, bandwidthCount: 0, subrequestCount: subrequestCount, testedIPs: [], stats: { avgLatency: 0, avgBandwidth: 0 } };
   }
 }
+
+// 区域7: DNS更新功能
 
 // 限制子请求版本的DNS更新 - 严格控制在指定数量内
 async function optimizedDNSUpdateLimited(env, ctx, maxSubrequests, dnsIPCount = 3, updateBothDomains = false) {
@@ -6361,10 +6307,8 @@ async function optimizedDNSUpdateLimited(env, ctx, maxSubrequests, dnsIPCount = 
   }
   
   try {
-    const config = getEnvConfig(env);
-    const uiConfig = await env.KV.get(CONFIG.kvKeys.uiConfig, 'json') || {};
-    // 使用传入的IP数量（默认3个）
-    const ipCount = Math.min(uiConfig.ipCount || config.defaultIpCount, dnsIPCount);
+    // 使用传入的IP数量（定时任务模式下直接使用传入的dnsIPCount，不受UI限制）
+    const ipCount = dnsIPCount;
     
     const countryDomains = dnsConfig?.countryDomains || {};
     const hasCountryDomains = Object.keys(countryDomains).length > 0;
@@ -6510,10 +6454,7 @@ async function updateDNSBatchLimited(env, ips, triggerSource = 'manual', recordN
       return { success: false, error: '域名未配置', subrequestCount };
     }
 
-    // 限制IP数量为3个（可由调用者控制传入的ips长度）
-    const MAX_DNS_IPS = 3;
-    const limitedIPs = ips.slice(0, MAX_DNS_IPS);
-
+    // 使用传入的ips数组（调用者已控制长度）
     const url = `https://api.cloudflare.com/client/v4/zones/${dnsConfig.zoneId}/dns_records`;
 
     // 获取现有DNS记录列表 (1个子请求)
@@ -6550,7 +6491,7 @@ async function updateDNSBatchLimited(env, ips, triggerSource = 'manual', recordN
 
     // 串行创建新记录
     let successCount = 0;
-    for (const ip of limitedIPs) {
+    for (const ip of ips) {
       if (subrequestCount + 1 > maxSubrequests) {
         await addSystemLog(env, `⚠️ DNS更新: 子请求不足，停止创建`);
         break;
@@ -6581,6 +6522,8 @@ async function updateDNSBatchLimited(env, ips, triggerSource = 'manual', recordN
     return { success: false, error: e.message, count: 0, subrequestCount };
   }
 }
+
+// 区域8: 定时任务
 
 // Cron定时任务入口 - 单次执行模式，严格控制在50个子请求内
 async function scheduled(event, env, ctx) {
@@ -6655,40 +6598,23 @@ async function scheduled(event, env, ctx) {
       
       // 步骤3: 发送Telegram通知（1个子请求）
       try {
-        const dnsConfig = await env.KV.get(CONFIG.kvKeys.dnsConfig, 'json');
-        if (dnsConfig?.telegramEnabled && dnsConfig?.telegramBotToken && dnsConfig?.telegramChatId) {
-          // 检查是否还有剩余子请求
-          if (subrequestCount + 1 <= MAX_SUBREQUESTS) {
-            // 构建域名信息
-            let domainInfo = '';
-            if (dnsResult.results && dnsResult.results.length > 0) {
-              domainInfo = '\n📍 更新域名:';
-              for (const result of dnsResult.results) {
-                const domain = result.domain || result.country || '未知';
-                domainInfo += `\n  • ${domain}`;
-              }
-            }
-            
-            // 格式化时间（上海时区 UTC+8）
-            const now = new Date();
-            const shanghaiTime = new Date(now.getTime() + 8 * 60 * 60 * 1000);
-            const timeStr = shanghaiTime.toISOString().replace('T', ' ').substring(0, 19);
-            
-            const text = `⏰ Cron任务完成\n📅 ${timeStr}\n✅ 测速成功: ${testResult.successCount}\n❌ 测速失败: ${testResult.failCount}\n🌐 DNS更新: ${dnsResult.success ? '成功' : '失败'}${domainInfo}`;
-            
-            await fetch(`https://api.telegram.org/bot${dnsConfig.telegramBotToken}/sendMessage`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                chat_id: dnsConfig.telegramChatId,
-                text: text,
-                parse_mode: 'HTML'
-              })
-            });
-            subrequestCount++;
-          } else {
-            await addSystemLog(env, `⚠️ 子请求不足，跳过Telegram通知`);
-          }
+        // 检查是否还有剩余子请求
+        if (subrequestCount + 1 <= MAX_SUBREQUESTS) {
+          // 使用统一的Telegram通知函数，直接使用测速返回的数据
+          await sendTelegramNotification(env, {
+            message: {
+              ipCount: testResult.successCount,
+              source: 'Cron定时任务',
+              domain: dnsResult.results?.map(r => r.domain || r.country).join(', ') || '未配置',
+              ips: testResult.testedIPs?.slice(0, 5),
+              stats: testResult.stats
+            },
+            hideIP: false,
+            type: dnsResult.success ? 'success' : 'warning'
+          });
+          subrequestCount++;
+        } else {
+          await addSystemLog(env, `⚠️ 子请求不足，跳过Telegram通知`);
         }
       } catch (e) {
         // 通知失败不影响主流程
