@@ -6539,6 +6539,8 @@ async function updateDNSBatchLimited(env, ips, triggerSource = 'manual', recordN
     // 串行创建新记录
     let successCount = 0;
     const updatedIPs = []; // 记录成功更新的IP
+    const failedIPs = [];  // 记录失败的IP
+    
     for (const ip of ips) {
       if (subrequestCount + 1 > maxSubrequests) {
         await addSystemLog(env, `⚠️ DNS更新: 子请求不足，停止创建`);
@@ -6553,18 +6555,28 @@ async function updateDNSBatchLimited(env, ips, triggerSource = 'manual', recordN
         });
         subrequestCount++;
         const result = await createResp.json();
+        
         if (result.success) {
           successCount++;
           updatedIPs.push(ip); // 记录成功更新的IP
+        } else {
+          // 记录失败原因
+          failedIPs.push({ ip, error: result.errors?.[0]?.message || '未知错误' });
+          await addSystemLog(env, `❌ DNS创建记录失败 ${ip}: ${result.errors?.[0]?.message || '未知错误'}`);
         }
-        await new Promise(r => setTimeout(r, 100));
       } catch (e) {
-        // 忽略创建错误
+        // 记录异常错误
+        failedIPs.push({ ip, error: e.message });
+        await addSystemLog(env, `❌ DNS创建记录异常 ${ip}: ${e.message}`);
       }
+      await new Promise(r => setTimeout(r, 100));
     }
 
+    // 记录详细结果
     if (successCount > 0) {
-      await addSystemLog(env, `✅ DNS更新成功: ${successCount} 个IP (域名: ${targetRecordName}, 消耗子请求: ${subrequestCount})`);
+      await addSystemLog(env, `✅ DNS更新成功: ${successCount}/${ips.length} 个IP (域名: ${targetRecordName}, 消耗子请求: ${subrequestCount})`);
+    } else {
+      await addSystemLog(env, `❌ DNS更新失败: 0/${ips.length} 个IP成功 (域名: ${targetRecordName}, 失败原因: ${failedIPs.map(f => f.error).join(', ')})`);
     }
     
     return { success: successCount > 0, count: successCount, domain: targetRecordName, subrequestCount, updatedIPs };
