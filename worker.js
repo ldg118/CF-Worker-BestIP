@@ -528,16 +528,6 @@ ${idx + 1}. <code>${ipDisplay}</code>
       });
     }
     
-    // 添加统计信息
-    if (message.stats) {
-      formattedMessage += `
-━━━━━━━━━━━━━━━
-<b>📊 统计信息</b>
-• 平均延迟：<b>${message.stats.avgLatency || 0}ms</b>
-• 平均带宽：<b>${message.stats.avgBandwidth || 0}Mbps</b>
-• 平均评分：<b>${message.stats.avgScore || 0}分</b>`;
-    }
-    
     // 添加版本信息
     formattedMessage += `
 ━━━━━━━━━━━━━━━
@@ -785,7 +775,7 @@ async function getIPGeo(env, ip) {
   env.DB.prepare('INSERT OR REPLACE INTO ip_geo_cache (ip, country, country_name, city, cached_at) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)')
     .bind(ip, geo.country, geo.countryName, geo.city).run().catch(() => {});
   geoCache.set(ip, geo);
-  return geo;
+  return { geo, usedAPI: false };
 }
 
 async function addFailedIP(env, ip) {
@@ -1175,7 +1165,7 @@ async function repairBandwidthPool(env) {
     let addedCount = 0;
     
     for (const ipData of goodIPs.results || []) {
-      const geo = await getIPGeo(env, ipData.ip);
+      const { geo } = await getIPGeo(env, ipData.ip);
       const score = calculateIPScore(ipData.latency, ipData.bandwidth || 0);
       
       await env.DB.prepare(`
@@ -1718,7 +1708,7 @@ async function updateRegionData(env, type = 'quality') {
     
     const stats = await env.DB.prepare(`
       SELECT ${selectFields}
-      FROM high_quality_ips WHERE country != 'unknown' GROUP BY country
+      FROM high_quality_ips GROUP BY country
     `).all();
     
     await addSystemLog(env, `🌍 更新区域数据: 从 high_quality_ips 获取到 ${stats.results?.length || 0} 个地区`);
@@ -2374,16 +2364,65 @@ async function handleDataQuery(env, type) {
       }
       
       case 'region-quality': {
-        const quality = await env.DB.prepare(`SELECT country, ip_count, avg_latency, avg_bandwidth, min_latency, max_latency, last_updated FROM region_quality ORDER BY avg_latency ASC LIMIT 20`).all();
-        const stats = await env.DB.prepare(`SELECT COUNT(*) as total_regions, SUM(ip_count) as total_ips, AVG(avg_latency) as global_avg_latency, AVG(avg_bandwidth) as global_avg_bandwidth FROM region_quality`).first();
-        await addSystemLog(env, `🔍 区域质量查询: ${quality.results?.length || 0} 个地区, 总IP: ${stats?.total_ips || 0}`);
+        // 直接从high_quality_ips表读取数据，绕过region_quality表
+        const highQualityIPs = await env.DB.prepare(`
+          SELECT country, latency, bandwidth 
+          FROM high_quality_ips 
+          ORDER BY latency ASC 
+          LIMIT 100
+        `).all();
+        
+        const ips = highQualityIPs.results || [];
+        
+        // 按国家分组计算统计数据
+        const countryStats = {};
+        ips.forEach(ip => {
+          const country = ip.country || 'unknown';
+          if (!countryStats[country]) {
+            countryStats[country] = {
+              country,
+              ipCount: 0,
+              totalLatency: 0,
+              totalBandwidth: 0,
+              minLatency: Infinity,
+              maxLatency: 0
+            };
+          }
+          countryStats[country].ipCount++;
+          countryStats[country].totalLatency += ip.latency;
+          countryStats[country].totalBandwidth += ip.bandwidth || 0;
+          countryStats[country].minLatency = Math.min(countryStats[country].minLatency, ip.latency);
+          countryStats[country].maxLatency = Math.max(countryStats[country].maxLatency, ip.latency);
+        });
+        
+        // 转换为数组并计算平均值
+        const regions = Object.values(countryStats).map(stat => ({
+          country: stat.country,
+          countryName: COUNTRY_NAMES[stat.country] || stat.country,
+          ipCount: stat.ipCount,
+          avgLatency: Math.round(stat.totalLatency / stat.ipCount),
+          avgBandwidth: stat.totalBandwidth > 0 ? Math.round((stat.totalBandwidth / stat.ipCount) * 10) / 10 : 0,
+          minLatency: stat.minLatency,
+          maxLatency: stat.maxLatency,
+          lastUpdated: new Date().toISOString()
+        })).sort((a, b) => a.avgLatency - b.avgLatency).slice(0, 20);
+        
+        // 计算全局统计数据
+        const totalIPs = ips.length;
+        const totalLatency = ips.reduce((sum, ip) => sum + ip.latency, 0);
+        const totalBandwidth = ips.reduce((sum, ip) => sum + (ip.bandwidth || 0), 0);
+        
+        const stats = {
+          total_regions: regions.length,
+          total_ips: totalIPs,
+          global_avg_latency: totalIPs > 0 ? totalLatency / totalIPs : 0,
+          global_avg_bandwidth: totalIPs > 0 ? totalBandwidth / totalIPs : 0
+        };
+        
+        await addSystemLog(env, `🔍 区域质量查询: 直接从high_quality_ips读取 ${regions.length} 个地区, 总IP: ${totalIPs}`);
         return {
           success: true,
-          regions: (quality.results || []).map(r => ({
-            country: r.country, countryName: COUNTRY_NAMES[r.country] || r.country,
-            ipCount: r.ip_count, avgLatency: r.avg_latency, avgBandwidth: r.avg_bandwidth,
-            minLatency: r.min_latency, maxLatency: r.max_latency, lastUpdated: r.last_updated
-          })),
+          regions,
           summary: stats
         };
       }
@@ -6660,26 +6699,47 @@ async function scheduled(event, env, ctx) {
       try {
         // 检查是否还有剩余子请求
         if (subrequestCount + 1 <= MAX_SUBREQUESTS) {
-          // 使用DNS实际更新的IP，而不是测速的所有IP
-          const notificationIPs = dnsResult.updatedIPs && dnsResult.updatedIPs.length > 0 
-            ? dnsResult.updatedIPs 
-            : testResult.testedIPs?.slice(0, 5) || [];
+          // 检查是否配置了域名
+          const hasConfiguredDomain = dnsConfig?.recordName || (dnsConfig?.countryDomains && Object.keys(dnsConfig.countryDomains).length > 0);
           
-          // 使用统一的Telegram通知函数，传入已读取的dnsConfig避免额外子请求
-          await sendTelegramNotification(env, {
-            message: {
-              ipCount: dnsResult.updatedIPCount || dnsResult.successCount || 0,  // 显示实际更新到DNS的IP数量
-              source: 'Cron定时任务',
-              domain: dnsResult.results?.map(r => r.domain || r.country).join(', ') || '未配置',
-              ips: notificationIPs,  // 显示实际更新到DNS的IP
-              stats: testResult.stats
-            },
-            hideIP: false,
-            type: dnsResult.success ? 'success' : 'warning',
-            dnsConfig: dnsConfig  // 传入已读取的配置，避免重复读取KV
-          });
-          subrequestCount++;
-          await addSystemLog(env, `📊 通知阶段消耗 1 个子请求，累计 ${subrequestCount} 个，剩余 ${MAX_SUBREQUESTS - subrequestCount} 个`);
+          if (!hasConfiguredDomain) {
+            // 未配置域名，发送提示信息而不显示IP列表
+            await sendTelegramNotification(env, {
+              message: {
+                ipCount: 0,
+                source: 'Cron定时任务',
+                domain: '未配置',
+                ips: [],  // 空IP列表
+                message: '未配置域名，跳过DNS更新'
+              },
+              hideIP: false,
+              type: 'warning',
+              dnsConfig: dnsConfig
+            });
+            subrequestCount++;
+            await addSystemLog(env, `📊 通知阶段消耗 1 个子请求，累计 ${subrequestCount} 个，剩余 ${MAX_SUBREQUESTS - subrequestCount} 个`);
+          } else {
+            // 已配置域名，使用DNS实际更新的IP
+            const notificationIPs = dnsResult.updatedIPs && dnsResult.updatedIPs.length > 0 
+              ? dnsResult.updatedIPs 
+              : [];
+            
+            // 使用统一的Telegram通知函数，传入已读取的dnsConfig避免额外子请求
+            await sendTelegramNotification(env, {
+              message: {
+                ipCount: dnsResult.updatedIPCount || dnsResult.successCount || 0,  // 显示实际更新到DNS的IP数量
+                source: 'Cron定时任务',
+                domain: dnsResult.results?.map(r => r.domain || r.country).join(', ') || '未配置',
+                ips: notificationIPs,  // 显示实际更新到DNS的IP
+                stats: testResult.stats
+              },
+              hideIP: false,
+              type: dnsResult.success ? 'success' : 'warning',
+              dnsConfig: dnsConfig  // 传入已读取的配置，避免重复读取KV
+            });
+            subrequestCount++;
+            await addSystemLog(env, `📊 通知阶段消耗 1 个子请求，累计 ${subrequestCount} 个，剩余 ${MAX_SUBREQUESTS - subrequestCount} 个`);
+          }
         } else {
           await addSystemLog(env, `⚠️ 子请求不足，跳过Telegram通知`);
         }
