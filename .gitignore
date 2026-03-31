@@ -1,0 +1,36 @@
+# Dependencies
+node_modules/
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Build outputs
+dist/
+build/
+
+# Logs
+logs
+*.log
+
+# Coverage
+coverage/
+
+# Wrangler
+.wrangler/
+.dev.vars
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project specific - 本地保留，不推送到远程
+历史版本/
+测试文件/
+备份/
+代理/
+重构为模块化结构/
+
+# IDE 配置
+.trae/
