@@ -1,0 +1,16 @@
+{
+  "name": "cf-best-ip",
+  "version": "1.0.0",
+  "description": "基于 Cloudflare Pages 的 IP 优选工具",
+  "main": "_worker.js",
+  "scripts": {
+    "dev": "wrangler pages dev .",
+    "deploy": "wrangler pages deploy . --project-name=cf-best-ip",
+    "d1:create": "wrangler d1 create cf-best-ip-db",
+    "d1:migrate": "wrangler d1 migrations apply cf-best-ip-db --remote",
+    "kv:create": "wrangler kv:namespace create KV"
+  },
+  "devDependencies": {
+    "wrangler": "^3.0.0"
+  }
+}

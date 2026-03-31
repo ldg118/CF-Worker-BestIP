@@ -54,8 +54,7 @@
 
 1. 点击 **编辑代码**
 2. 删除默认代码
-<<<<<<< HEAD
-3. 复制 [`worker.js`](./worker.js) 全部内容粘贴进去
+3. 复制 [`worker.js`](./worker.js) 或[`混淆加密`](./混淆加密) 全部内容粘贴进去
 4. 点击 **保存并部署**
 
 > **注意**：两种方式功能相同，任选其一即可。混淆加密版本代码经过压缩混淆，体积更小但不可读。
@@ -126,7 +125,22 @@ Pages 部署适合需要快速部署前端界面，同时支持后端 Functions 
 
 点击右上角 **Fork** 按钮，将项目复制到你的 GitHub 账户。
 
-##### 步骤 2：创建 D1 和 KV（提前准备）
+##### 步骤 2：准备 Pages 部署目录
+
+项目使用 `pages/` 目录作为部署根目录：
+
+```
+pages/
+├── _worker.js              # 主程序入口
+├── wrangler.toml           # 配置文件
+├── package.json            # 依赖配置
+├── migrations/
+│   └── 001_init.sql        # 数据库初始化脚本
+└── public/
+    └── index.html          # 静态页面
+```
+
+##### 步骤 3：创建 D1 和 KV（提前准备）
 
 1. **创建 D1 数据库**：
    - 登录 [Cloudflare Dashboard](https://dash.cloudflare.com)
@@ -137,9 +151,22 @@ Pages 部署适合需要快速部署前端界面，同时支持后端 Functions 
    - 进入 **Workers 和 Pages** → **KV**
    - 点击 **创建命名空间**，名称填写 `cf-best-ip-kv`
    - 记录命名空间 ID
-     **方案 B：使用 Wrangler CLI（适合熟悉命令行的用户）**
 
-##### 步骤 3：配置 Cloudflare Pages
+编辑 `pages/wrangler.toml`，填入数据库和 KV ID：
+
+```toml
+[[d1_databases]]
+binding = "DB"
+database_name = "cf-best-ip-db"
+database_id = "your-database-id"  # 替换为你的数据库 ID
+
+[[kv_namespaces]]
+binding = "KV"
+id = "your-kv-id"               # 替换为你的 KV ID
+preview_id = "your-kv-preview-id"
+```
+
+##### 步骤 4：配置 Cloudflare Pages
 
 1. 登录 [Cloudflare Dashboard](https://dash.cloudflare.com)
 2. 进入 **Workers 和 Pages** → **创建项目** → **Pages**
@@ -148,10 +175,11 @@ Pages 部署适合需要快速部署前端界面，同时支持后端 Functions 
 5. 构建设置：
    - **框架预设**：`None`
    - **构建命令**：留空（无需构建）
-   - **构建输出目录**：`./`
+   - **构建输出目录**：留空
+   - **根目录**：`pages`  ← 关键配置，指向 pages 目录
 6. 点击 **保存并部署**
 
-##### 步骤 4：绑定 D1 和 KV
+##### 步骤 5：绑定 D1 和 KV
 
 1. 进入 Pages 项目 → **设置** → **函数**
 2. **KV 命名空间绑定**：
@@ -162,7 +190,7 @@ Pages 部署适合需要快速部署前端界面，同时支持后端 Functions 
    - 选择刚创建的 D1 数据库
 4. 点击 **保存**
 
-##### 步骤 5：配置环境变量
+##### 步骤 6：配置环境变量
 
 在 Pages 项目 → **设置** → **环境变量** 中添加：
 
@@ -170,7 +198,7 @@ Pages 部署适合需要快速部署前端界面，同时支持后端 Functions 
 ADMIN_PASSWORD = your_secure_password
 ```
 
-##### 步骤 6：重新部署
+##### 步骤 7：重新部署
 
 在 Pages 控制台点击 **重新部署**，使绑定和环境变量生效。
 
@@ -183,16 +211,18 @@ ADMIN_PASSWORD = your_secure_password
 ##### 步骤 1：准备文件
 
 1. 下载本仓库代码
-2. 确保文件结构如下：
+2. 进入 `pages/` 目录，确保文件结构如下：
    ```
-   /
-   ├── _worker.js          # 主程序
+   pages/
+   ├── _worker.js
+   ├── wrangler.toml
+   ├── package.json
    ├── migrations/
-   │   └── 001_init.sql    # 数据库初始化脚本
+   │   └── 001_init.sql
    └── public/
-       └── index.html      # 可选的静态页面
+       └── index.html
    ```
-3. 将上述文件打包成 zip 压缩包
+3. 将 `pages/` 目录内的文件打包成 zip 压缩包
 
 ##### 步骤 2：创建 Pages 项目
 
@@ -205,14 +235,7 @@ ADMIN_PASSWORD = your_secure_password
 
 ##### 步骤 3：创建并绑定资源
 
-同方案 A 的步骤 2、4、5、6。
-
-> **原理说明**：Pages 支持两种 Worker 方式：
->
-> - **根目录 Worker**（`_worker.js`）：简单直接，适合单文件应用
-> - **Functions 目录**（`/functions/`）：支持复杂路由，适合多文件应用
->
-> 本项目使用根目录 Worker 方式，直接使用 `_worker.js` 文件。
+同方案 A 的步骤 3、5、6。
 
 ***
 
