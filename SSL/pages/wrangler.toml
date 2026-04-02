@@ -1,0 +1,13 @@
+name = "dns-manager-pages"
+compatibility_date = "2024-01-01"
+
+# D1 数据库绑定
+[[d1_databases]]
+binding = "DB"
+database_name = "dns-manager-db"
+database_id = "your-database-id-here"
+
+# KV 命名空间绑定（用于会话、设置、日志等临时数据）
+[[kv_namespaces]]
+binding = "KV"
+id = "your-kv-namespace-id"

@@ -6522,7 +6522,7 @@ async function scheduled(event, env, ctx) {
 
 
     const availableSubrequestsForTest = MAX_SUBREQUESTS - DNS_SUBREQUESTS - NOTIFICATION_SUBREQUESTS;
-    const maxTestIPsBySubrequest = Math.floor(availableSubrequestsForTest / 3); // 每个IP最多消耗3个子请求（延迟1+带宽1+地理位置1）
+    const maxTestIPsBySubrequest = Math.floor(availableSubrequestsForTest / 2); // 每个IP实际消耗2个子请求（延迟1+带宽1），地理位置通常有缓存
 
     const minTestIPs = hasBothDomains ? 8 : 10;
     const maxTestIPsLimit = hasBothDomains ? 15 : 17;

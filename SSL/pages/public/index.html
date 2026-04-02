@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DNS Manager Pro</title>
+    <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+    <!-- 登录页面 -->
+    <div id="loginPage" class="login-container">
+        <div class="login-box">
+            <div class="login-logo">
+                <div class="login-logo-icon">🌐</div>
+                <h2>DNS Manager Pro</h2>
+                <p>聚合 DNS 管理系统</p>
+            </div>
+            <form id="loginForm">
+                <div class="form-group">
+                    <label class="form-label">管理密码</label>
+                    <input type="password" class="form-input" id="loginPassword" required placeholder="请输入管理密码">
+                    <small style="color: var(--text-secondary); margin-top: 8px; display: block; font-size: 0.875rem;">默认密码: admin123</small>
+                </div>
+                <button type="submit" class="btn btn-primary" style="width: 100%;">登 录</button>
+            </form>
+        </div>
+    </div>
+
+    <!-- 主应用页面 -->
+    <div id="appPage" style="display: none;">
+        <!-- 顶部导航栏 -->
+        <header class="app-header">
+            <div class="app-header-content">
+                <div class="app-logo">
+                    <div class="app-logo-icon">🌐</div>
+                    <h1>DNS Manager <span>Pro</span></h1>
+                </div>
+                <div class="user-menu">
+                    <span id="userName">管理员</span>
+                    <button class="btn btn-secondary btn-sm" onclick="showChangePasswordModal()">修改密码</button>
+                    <button class="btn btn-danger btn-sm" onclick="logout()">退出</button>
+                </div>
+            </div>
+        </header>
+
+        <div class="app-layout">
+            <!-- 左侧边栏导航 -->
+            <nav class="sidebar">
+                <button class="sidebar-item active" data-tab="accounts">
+                    <span class="sidebar-icon">📁</span>
+                    <span>DNS 账户</span>
+                </button>
+                <button class="sidebar-item" data-tab="domains">
+                    <span class="sidebar-icon">🌐</span>
+                    <span>域名管理</span>
+                </button>
+                <button class="sidebar-item" data-tab="records">
+                    <span class="sidebar-icon">📝</span>
+                    <span>解析记录</span>
+                </button>
+                <button class="sidebar-item" data-tab="certificates">
+                    <span class="sidebar-icon">🔒</span>
+                    <span>SSL 证书</span>
+                </button>
+                <button class="sidebar-item" data-tab="logs">
+                    <span class="sidebar-icon">📋</span>
+                    <span>系统日志</span>
+                </button>
+            </nav>
+
+            <!-- 主内容区域 -->
+            <main class="main-content">
+                <!-- 统计卡片 -->
+                <div class="stats-grid">
+                    <div class="stat-card">
+                        <div class="stat-icon blue">📁</div>
+                        <div class="stat-value" id="accountCount">0</div>
+                        <div class="stat-label">DNS 账户</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon green">🌐</div>
+                        <div class="stat-value" id="domainCount">0</div>
+                        <div class="stat-label">域名数量</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon orange">📝</div>
+                        <div class="stat-value" id="recordCount">0</div>
+                        <div class="stat-label">解析记录</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon purple">🔒</div>
+                        <div class="stat-value" id="certCount">0</div>
+                        <div class="stat-label">SSL 证书</div>
+                    </div>
+                </div>
+
+                <!-- DNS 账户管理 -->
+                <div class="tab-content active" id="accounts-tab">
+                    <div class="card">
+                        <div class="card-header">
+                            <div class="card-title">📁 DNS 账户管理</div>
+                            <button class="btn btn-primary" onclick="showAccountModal()">+ 添加账户</button>
+                        </div>
+                        <div class="card-body">
+                            <div id="accountsList">
+                                <div class="empty-state">
+                                    <div class="empty-state-icon">📁</div>
+                                    <h3>暂无 DNS 账户</h3>
+                                    <p>请点击上方按钮添加您的第一个账户</p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 域名管理 -->
+                <div class="tab-content" id="domains-tab">
+                    <div class="card">
+                        <div class="card-header">
+                            <div class="card-title">🌐 域名管理</div>
+                            <div class="actions">
+                                <button class="btn btn-success" onclick="showManualDomainModal()">+ 手动添加</button>
+                                <button class="btn btn-primary" onclick="syncDomains()">🔄 同步</button>
+                            </div>
+                        </div>
+                        <div class="card-body">
+                            <div id="domainsList">
+                                <div class="empty-state">
+                                    <div class="empty-state-icon">🌐</div>
+                                    <h3>暂无域名</h3>
+                                    <p>请先添加 DNS 账户并同步，或手动添加第三方域名</p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 解析记录管理 -->
+                <div class="tab-content" id="records-tab">
+                    <div class="card">
+                        <div class="card-header">
+                            <div class="card-title">📝 解析记录管理</div>
+                            <div class="actions">
+                                <select id="domainSelect" class="form-select" style="width: 180px;">
+                                    <option value="">选择域名</option>
+                                </select>
+                                <button class="btn btn-secondary" onclick="syncRecords()">🔄 同步</button>
+                                <button class="btn btn-primary" onclick="showRecordModal()">+ 添加</button>
+                            </div>
+                        </div>
+                        <div class="card-body">
+                            <div id="recordsList">
+                                <div class="empty-state">
+                                    <div class="empty-state-icon">📝</div>
+                                    <h3>暂无解析记录</h3>
+                                    <p>请选择域名查看或添加解析记录</p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- SSL 证书管理 -->
+                <div class="tab-content" id="certificates-tab">
+                    <div class="card">
+                        <div class="card-header">
+                            <div class="card-title">🔒 SSL 证书管理</div>
+                            <button class="btn btn-primary" onclick="showCertModal()">+ 申请证书</button>
+                        </div>
+                        <div class="card-body">
+                            <div id="certificatesList">
+                                <div class="empty-state">
+                                    <div class="empty-state-icon">🔒</div>
+                                    <h3>暂无 SSL 证书</h3>
+                                    <p>点击上方按钮申请您的第一个证书</p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 系统日志 -->
+                <div class="tab-content" id="logs-tab">
+                    <div class="card">
+                        <div class="card-header">
+                            <div class="card-title">📋 系统日志</div>
+                            <button class="btn btn-secondary" onclick="loadLogs()">🔄 刷新</button>
+                        </div>
+                        <div class="card-body">
+                            <div id="logsList">
+                                <div class="empty-state">
+                                    <div class="empty-state-icon">📋</div>
+                                    <h3>暂无日志</h3>
+                                    <p>系统操作记录将显示在这里</p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </main>
+        </div>
+    </div>
+
+    <div class="toast" id="toast"></div>
+
+    <script src="/js/app.js"></script>
+</body>
+</html>

@@ -3,7 +3,7 @@ const GITHUB_URL = 'https://github.com/ldg118/CF-Worker-BestIP';
 
 const CONFIG = {
   defaultSources: [
-    'https://raw.githubusercontent.com/ldg118/CF-Worker-BestIP/refs/heads/main/cfv4'
+   // 'https://raw.githubusercontent.com/ldg118/CF-Worker-BestIP/refs/heads/main/cfv4'
   ],
   kvKeys: {
     dnsConfig: 'dns_config',
@@ -693,7 +693,8 @@ async function getIPGeo(env, ip, request = null) {
   const cached = geoCache.get(ip);
   if (cached) return { geo: cached, usedAPI: false };
 
-
+  // 统一显示IP注册地信息（不尝试识别实际落地）
+  // 直接使用数据库缓存或外部API获取注册地
 
   try {
     const dbCached = await env.DB.prepare('SELECT country, country_name, city FROM ip_geo_cache WHERE ip = ?').bind(ip).first();
@@ -704,7 +705,7 @@ async function getIPGeo(env, ip, request = null) {
     }
   } catch (e) {}
 
-
+  // 如果数据库缓存也没有，使用外部API获取IP注册地（消耗1个子请求）
   try {
     const resp = await fetch(`http://ip-api.com/json/${ip}?fields=status,country,countryCode,city`, { signal: AbortSignal.timeout(2000) });
     if (resp.ok) {
@@ -2280,6 +2281,7 @@ async function handleDataQuery(env, type) {
 
       case 'region-quality': {
 
+        // 先清理数据库中的重复IP记录
         await env.DB.prepare(`
           DELETE FROM high_quality_ips 
           WHERE rowid NOT IN (
@@ -2294,14 +2296,17 @@ async function handleDataQuery(env, type) {
           )
         `).run();
 
+        // 获取用户设置的池大小
         const advancedConfig = await getAdvancedConfig(env);
         const maxBackupPoolSize = advancedConfig.maxBackupPoolSize || 50;
 
+        // 正确统计：获取所有IP，去重处理
         const highQualityIPs = await env.DB.prepare(`
           SELECT DISTINCT ip, country, latency, bandwidth 
           FROM high_quality_ips 
         `).all();
 
+        // 获取备用池IP，数量与用户设置一致
         const backupQualityIPs = await env.DB.prepare(`
           SELECT DISTINCT ip, country, latency, bandwidth 
           FROM backup_quality_ips 
@@ -2309,6 +2314,7 @@ async function handleDataQuery(env, type) {
           LIMIT ?
         `).bind(maxBackupPoolSize).all();
 
+        // 合并并去重（基于IP地址）
         const ipMap = new Map();
         
         [...(highQualityIPs.results || []), ...(backupQualityIPs.results || [])].forEach(ip => {
@@ -6522,7 +6528,7 @@ async function scheduled(event, env, ctx) {
 
 
     const availableSubrequestsForTest = MAX_SUBREQUESTS - DNS_SUBREQUESTS - NOTIFICATION_SUBREQUESTS;
-    const maxTestIPsBySubrequest = Math.floor(availableSubrequestsForTest / 3); // 每个IP最多消耗3个子请求（延迟1+带宽1+地理位置1）
+    const maxTestIPsBySubrequest = Math.floor(availableSubrequestsForTest / 2); // 每个IP实际消耗2个子请求（延迟1+带宽1），地理位置通常有缓存
 
     const minTestIPs = hasBothDomains ? 8 : 10;
     const maxTestIPsLimit = hasBothDomains ? 15 : 17;
