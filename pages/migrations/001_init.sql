@@ -76,3 +76,6 @@ CREATE INDEX IF NOT EXISTS idx_high_quality_latency ON high_quality_ips(latency)
 CREATE INDEX IF NOT EXISTS idx_high_quality_country ON high_quality_ips(country);
 CREATE INDEX IF NOT EXISTS idx_high_quality_type ON high_quality_ips(quality_type);
 CREATE INDEX IF NOT EXISTS idx_speed_results_country ON speed_results(country);
+CREATE INDEX IF NOT EXISTS idx_speed_results_bandwidth ON speed_results(bandwidth);
+CREATE INDEX IF NOT EXISTS idx_speed_results_delay ON speed_results(delay);
+CREATE INDEX IF NOT EXISTS idx_speed_results_last_tested ON speed_results(last_tested);

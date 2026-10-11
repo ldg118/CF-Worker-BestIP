@@ -12,7 +12,9 @@ id = ""
 preview_id = ""
 
 [vars]
-ADMIN_PASSWORD = "123"
+# 安全：不要把密码写在这里（本文件会进仓库）。
+# 请用 `wrangler secret put ADMIN_PASSWORD`，或在 Cloudflare 面板 Settings -> Variables 配置。
+# 未配置时后台将无法登录 —— 这是有意的设计。
 DEFAULT_IP_COUNT = "3"
 DEFAULT_TEST_COUNT = "50"
 DEFAULT_THREAD_COUNT = "10"

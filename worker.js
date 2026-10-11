@@ -45,6 +45,16 @@ const COUNTRY_NAMES = {
 
 const ASIA_REGIONS = ['CN', 'JP', 'KR', 'SG', 'HK', 'TW'];
 
+// 会话有效期（毫秒）。超过即失效，需重新登录。
+const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+// 会话校验的 isolate 内短缓存，避免每个请求（含未授权请求与扫描器）都读一次 KV。
+const sessionCache = new Map();
+const SESSION_CACHE_MS = 30 * 1000;
+const SESSION_CACHE_MAX = 500;
+// speed_results 保留窗口与硬上限（纯兜底，防止这张表无限增长）。
+const SPEED_RESULTS_KEEP_DAYS = 30;
+const SPEED_RESULTS_MAX_ROWS = 5000;
+
 const INIT_SQL = `
 CREATE TABLE IF NOT EXISTS speed_results (
   ip TEXT PRIMARY KEY,
@@ -124,6 +134,9 @@ CREATE INDEX IF NOT EXISTS idx_high_quality_latency ON high_quality_ips(latency)
 CREATE INDEX IF NOT EXISTS idx_high_quality_country ON high_quality_ips(country);
 CREATE INDEX IF NOT EXISTS idx_high_quality_type ON high_quality_ips(quality_type);
 CREATE INDEX IF NOT EXISTS idx_speed_results_country ON speed_results(country);
+CREATE INDEX IF NOT EXISTS idx_speed_results_bandwidth ON speed_results(bandwidth);
+CREATE INDEX IF NOT EXISTS idx_speed_results_delay ON speed_results(delay);
+CREATE INDEX IF NOT EXISTS idx_speed_results_last_tested ON speed_results(last_tested);
 `;
 
 
@@ -175,6 +188,11 @@ function cleanupIpBandwidthTestCache() {
 
 let writeQueue = [];
 let writeTimer = null;
+
+// D1 每请求开销治理：初始化只在 isolate 冷启动时执行一次；清理任务限频（默认每小时最多一次）
+let __dbReady = false;
+let __lastCleanup = 0;
+const CLEANUP_INTERVAL_MS = 60 * 60 * 1000;
 
 const ipRegex = /^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/;
 
@@ -337,9 +355,16 @@ const SessionManager = {
 
   async verify(sessionId, env) {
     if (!sessionId) return false;
+    const cached = sessionCache.get(sessionId);
+    if (cached && Date.now() - cached.at < SESSION_CACHE_MS) return cached.ok;
     try {
       const sessions = await env.KV.get(CONFIG.kvKeys.sessions, 'json');
-      return sessions && sessions[sessionId];
+      const s = sessions && sessions[sessionId];
+      // 必须带 createdAt 且在有效期内；历史遗留的无 createdAt 会话一律视为失效
+      const ok = !!(s && s.createdAt && Date.now() - s.createdAt <= SESSION_TTL_MS);
+      if (sessionCache.size > SESSION_CACHE_MAX) sessionCache.clear();
+      sessionCache.set(sessionId, { ok, at: Date.now() });
+      return ok;
     } catch { return false; }
   },
 
@@ -353,7 +378,13 @@ const SessionManager = {
       if (password === config.adminPassword) {
         const sessionId = generateSessionId();
         const sessions = await env.KV.get(CONFIG.kvKeys.sessions, 'json') || {};
-        sessions[sessionId] = { createdAt: Date.now() };
+        // 顺手剔除已过期会话，避免 sessions 对象无限增长
+        const now = Date.now();
+        for (const key of Object.keys(sessions)) {
+          const prev = sessions[key];
+          if (!prev || !prev.createdAt || now - prev.createdAt > SESSION_TTL_MS) delete sessions[key];
+        }
+        sessions[sessionId] = { createdAt: now };
         await env.KV.put(CONFIG.kvKeys.sessions, JSON.stringify(sessions));
         await addSystemLog(env, '🔐 管理员登录成功');
         return new Response(JSON.stringify({ success: true, sessionId }), { headers: { 'Content-Type': 'application/json' } });
@@ -370,6 +401,7 @@ const SessionManager = {
     if (sessionId) {
       const sessions = await env.KV.get(CONFIG.kvKeys.sessions, 'json') || {};
       delete sessions[sessionId];
+      sessionCache.delete(sessionId);
       await env.KV.put(CONFIG.kvKeys.sessions, JSON.stringify(sessions));
       await addSystemLog(env, '🔓 管理员登出');
     }
@@ -587,11 +619,9 @@ const LogManager = {
     const now = new Date();
     const timeStr = now.toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false });
     this.queue.push({ timeStr, message });
-    if (this.queue.length >= 20) {
-      await this.flush(env);
-    } else if (!this.timer) {
-      this.timer = setTimeout(() => this.flush(env), 5000);
-    }
+    // Worker 里响应结束后 setTimeout 不再保证触发，日志会静默丢失。
+    // 日志量很小（每天几十条），这里直接落盘，用一次 D1 batch 换可靠性。
+    await this.flush(env);
   },
 
   async flush(env) {
@@ -659,7 +689,8 @@ async function getConfig(env, type, countSubrequests = false) {
       subrequestCount++;
       const result = {
         autoClean: savedConfig.autoClean !== false,
-        cleanDays: Math.min(7, Math.max(3, parseInt(savedConfig.cleanDays) || 7))
+        cleanDays: Math.min(7, Math.max(3, parseInt(savedConfig.cleanDays) || 7)),
+        maxLogRows: Math.min(5000, Math.max(100, parseInt(savedConfig.maxLogRows) || 1000))
       };
       return countSubrequests ? { config: result, subrequestCount } : result;
     }
@@ -679,7 +710,9 @@ async function getLogConfig(env) {
 
 function getEnvConfig(env) {
     return {
-      adminPassword: env.ADMIN_PASSWORD || '123',
+      // 安全：不再内置默认密码。未配置 ADMIN_PASSWORD 时后台登录会被直接拒绝。
+      // 请在 Cloudflare 配置环境变量 / Secret（Worker → Settings → Variables）。
+      adminPassword: env.ADMIN_PASSWORD || '',
       defaultIpCount: env.DEFAULT_IP_COUNT ? parseInt(env.DEFAULT_IP_COUNT) : 3,
       defaultTestCount: env.DEFAULT_TEST_COUNT ? parseInt(env.DEFAULT_TEST_COUNT) : 30,
       defaultThreadCount: env.DEFAULT_THREAD_COUNT ? parseInt(env.DEFAULT_THREAD_COUNT) : 10,
@@ -718,7 +751,7 @@ async function getIPGeo(env, ip, request = null) {
         };
         
         // 缓存到数据库
-        env.DB.prepare('INSERT OR REPLACE INTO ip_geo_cache (ip, country, country_name, city, cached_at) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)')
+        await env.DB.prepare('INSERT OR REPLACE INTO ip_geo_cache (ip, country, country_name, city, cached_at) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)')
           .bind(ip, geo.country, geo.countryName, geo.city).run().catch(() => {});
         
         geoCache.set(ip, geo);
@@ -729,7 +762,7 @@ async function getIPGeo(env, ip, request = null) {
 
   // 如果API也失败，直接返回未知地理位置
   const geo = { country: 'unknown', countryName: '未知', city: '' };
-  env.DB.prepare('INSERT OR REPLACE INTO ip_geo_cache (ip, country, country_name, city, cached_at) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)')
+  await env.DB.prepare('INSERT OR REPLACE INTO ip_geo_cache (ip, country, country_name, city, cached_at) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)')
     .bind(ip, geo.country, geo.countryName, geo.city).run().catch(() => {});
   geoCache.set(ip, geo);
   return { geo, usedAPI: false };
@@ -755,14 +788,7 @@ async function cleanPool(env, config) {
   try {
     if (condition && !condition()) return;
 
-    let sql;
-    if (table === 'system_logs') {
-
-      sql = `DELETE FROM ${table} WHERE julianday('now') - julianday(datetime(substr(${timeField}, 1, 10) || ' ' || substr(${timeField}, 12), 'localtime')) > ?`;
-    } else {
-      sql = `DELETE FROM ${table} WHERE julianday('now') - julianday(${timeField}) > ?`;
-    }
-
+    const sql = `DELETE FROM ${table} WHERE julianday('now') - julianday(${timeField}) > ?`;
     await env.DB.prepare(sql).bind(days).run();
 
     if (afterClean) await afterClean();
@@ -789,12 +815,35 @@ async function cleanExpiredGeoCache(env) {
 
 async function cleanExpiredLogs(env) {
   const logConfig = await getLogConfig(env);
-  return cleanPool(env, {
-    table: 'system_logs',
-    timeField: 'time_str',
-    days: logConfig.cleanDays,
-    condition: () => logConfig.autoClean
-  });
+  if (!logConfig.autoClean) return;
+  try {
+    // 按天清理。注意 time_str 是 zh-CN 的 "YYYY/MM/DD HH:MM:SS"（斜杠），
+    // SQLite 的 datetime() 不认斜杠格式，会返回 NULL 使判定恒为假 —— 这正是历史上日志一行都没删掉的原因。
+    // 先用 replace 归一成 ISO 横杠格式，表达式才真正生效。
+    await env.DB.prepare(
+      "DELETE FROM system_logs WHERE julianday('now') - julianday(datetime(replace(time_str, '/', '-'), 'localtime')) > ?"
+    ).bind(logConfig.cleanDays).run();
+    // 硬上限兜底：不论日期格式怎么变，system_logs 都不会超过 maxLogRows 行。
+    // 走主键范围删除（id <= MAX(id) - N），只读被删的那些行，代价极低。
+    await env.DB.prepare(
+      'DELETE FROM system_logs WHERE id <= (SELECT MAX(id) FROM system_logs) - ?'
+    ).bind(logConfig.maxLogRows).run();
+  } catch (e) {}
+}
+
+// speed_results 原先完全没有清理机制：每次测速都 INSERT OR REPLACE，只增不减，
+// 而所有针对它的查询都缺可用索引，只能全表扫 —— 会重演 system_logs 那次的用量事故。
+async function cleanExpiredSpeedResults(env) {
+  try {
+    // 1) 按时间清理：查询口径本来就是「只看 30 天内」，超期的行删掉不影响结果
+    await env.DB.prepare(
+      "DELETE FROM speed_results WHERE julianday('now') - julianday(last_tested) > ?"
+    ).bind(SPEED_RESULTS_KEEP_DAYS).run();
+    // 2) 硬上限兜底：该表主键是 TEXT 的 ip、没有自增列，改用隐式 rowid 保留最新 N 条
+    await env.DB.prepare(
+      'DELETE FROM speed_results WHERE rowid <= (SELECT MAX(rowid) FROM speed_results) - ?'
+    ).bind(SPEED_RESULTS_MAX_ROWS).run();
+  } catch (e) {}
 }
 
 
@@ -3407,7 +3456,7 @@ async function getMainHTML(env) {
 
         const tableBody = document.getElementById('regionStatsTable');
         if (regions.length > 0) {
-          tableBody.innerHTML = regions.map(r => '<tr><td><span class="country-badge">' + (r.countryName || r.country) + '</span></td><td>' + r.ipCount + '</td><td><span class="latency-badge ' + getLatencyClass(r.avgLatency) + '">' + Math.round(r.avgLatency) + 'ms</span></td><td>' + (r.avgBandwidth ? parseFloat(r.avgBandwidth).toFixed(1) + 'Mbps' : '0Mbps') + '</td><td>' + (r.minLatency || '--') + 'ms</td><td>' + (r.maxLatency || '--') + 'ms</td><td>' + (r.lastUpdated || '--') + '</td></tr>').join('');
+          tableBody.innerHTML = regions.map(r => '<tr><td><span class="country-badge">' + escapeHtml(r.countryName || r.country) + '</span></td><td>' + r.ipCount + '</td><td><span class="latency-badge ' + getLatencyClass(r.avgLatency) + '">' + Math.round(r.avgLatency) + 'ms</span></td><td>' + (r.avgBandwidth ? parseFloat(r.avgBandwidth).toFixed(1) + 'Mbps' : '0Mbps') + '</td><td>' + (r.minLatency || '--') + 'ms</td><td>' + (r.maxLatency || '--') + 'ms</td><td>' + (r.lastUpdated || '--') + '</td></tr>').join('');
         } else {
           tableBody.innerHTML = '<tr><td colspan="7" style="text-align:center;padding:40px;">暂无区域数据，请先进行测速或更新IP列表</td></tr>';
         }
@@ -3945,7 +3994,7 @@ async function getMainHTML(env) {
       const res = await fetch('/api/get-logs');
       const data = await res.json();
       const panel = document.getElementById('logPanel');
-      if (data.logs?.length) panel.innerHTML = data.logs.map(l => '<div class="log-entry"><span class="log-time">[' + l.timeStr + ']</span> ' + escapeHtml(l.message) + '</div>').join('');
+      if (data.logs?.length) panel.innerHTML = data.logs.map(l => '<div class="log-entry"><span class="log-time">[' + escapeHtml(l.timeStr) + ']</span> ' + escapeHtml(l.message) + '</div>').join('');
       else panel.innerHTML = '<div class="log-entry">暂无日志</div>';
     } catch(e) {}
   }
@@ -5295,12 +5344,17 @@ export default {
     const path = url.pathname;
     const config = getEnvConfig(env);
 
-    ctx.waitUntil((async () => {
-      await initDatabase(env);
-    })().catch(() => {}));
-    ctx.waitUntil(cleanExpiredFailedIPs(env).catch(() => {}));
-    ctx.waitUntil(cleanExpiredGeoCache(env).catch(() => {}));
-    ctx.waitUntil(cleanExpiredLogs(env).catch(() => {}));
+    if (!__dbReady) {
+      __dbReady = true; // 先占位，避免并发请求重复初始化
+      ctx.waitUntil(initDatabase(env).then(ok => { if (!ok) __dbReady = false; }).catch(() => { __dbReady = false; }));
+    }
+    if (Date.now() - __lastCleanup > CLEANUP_INTERVAL_MS) {
+      __lastCleanup = Date.now();
+      ctx.waitUntil(cleanExpiredFailedIPs(env).catch(() => {}));
+      ctx.waitUntil(cleanExpiredGeoCache(env).catch(() => {}));
+      ctx.waitUntil(cleanExpiredLogs(env).catch(() => {}));
+      ctx.waitUntil(cleanExpiredSpeedResults(env).catch(() => {}));
+    }
 
     if (request.method === 'OPTIONS') {
       return new Response(null, {
@@ -5404,7 +5458,7 @@ export default {
       const minBandwidth = parseInt(url.searchParams.get('minBandwidth')) || 0;
       const maxLatency = parseInt(url.searchParams.get('maxLatency')) || 9999;
       const sortBy = url.searchParams.get('sortBy') || 'bandwidth';
-      const limit = parseInt(url.searchParams.get('limit')) || 100;
+      const limit = Math.min(1000, Math.max(1, parseInt(url.searchParams.get('limit')) || 100));
 
       try {
         let sql = `
@@ -5468,7 +5522,7 @@ export default {
       const minBandwidth = parseInt(url.searchParams.get('minBandwidth')) || 0;
       const maxLatency = parseInt(url.searchParams.get('maxLatency')) || 9999;
       const sortBy = url.searchParams.get('sortBy') || 'bandwidth';
-      const limit = parseInt(url.searchParams.get('limit')) || 100;
+      const limit = Math.min(1000, Math.max(1, parseInt(url.searchParams.get('limit')) || 100));
 
       try {
         let sql = `
@@ -5860,7 +5914,7 @@ export default {
       await addSystemLog(env, `⚙️ 日志配置已保存: 自动清理=${logConfig.autoClean}, 清理周期=${logConfig.cleanDays}天`);
       return new Response(JSON.stringify({ success: true, config: logConfig }), { headers: { 'Content-Type': 'application/json' } });
     }
-    if (path === '/api/update') {
+    if (path === '/api/update' && request.method === 'POST') {
       ctx.waitUntil(updateIPs(env));
       await addSystemLog(env, '🔄 手动触发IP列表更新');
       return new Response(JSON.stringify({ status: '更新任务已启动' }), { headers: { 'Content-Type': 'application/json' } });
