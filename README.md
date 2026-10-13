@@ -1,9 +1,9 @@
 # CF 优选 IP · 智能双池管理系统
 
-<p align="center">
-  <img src="https://img.shields.io/badge/version-v4.6.2-blue" alt="version">
-  <img src="https://img.shields.io/badge/platform-Cloudflare%20Workers%20%7C%20Pages-orange" alt="platform">
-  <img src="https://img.shields.io/badge/license-MIT-green" alt="license">
+<p align="center">  
+  <img src="https://img.shields.io/badge/version-v4.6.2-blue" alt="version">  
+  <img src="https://img.shields.io/badge/platform-Cloudflare%20Workers%20%7C%20Pages-orange" alt="platform">  
+  <img src="https://img.shields.io/badge/license-MIT-green" alt="license">  
 </p>
 
 基于 Cloudflare Workers/Pages 的 IP 优选工具，集成带宽测试、延迟测试、智能 DNS 更新、多国家分流、Telegram 通知等功能。
@@ -33,11 +33,14 @@
 - 🔍 **智能搜索** - IP 快速筛选定位
 - 🌙 **深色主题** - 护眼配色方案
 
-
 ### 登录界面
+
 ![登录界面截图](https://raw.githubusercontent.com/ldg118/CF-Worker-BestIP/refs/heads/main/docs/images/1.png)
+
 ### 操作界面
+
 ![操作界面截图1](https://raw.githubusercontent.com/ldg118/CF-Worker-BestIP/refs/heads/main/docs/images/2.png)
+
 ![操作界面截图2](https://raw.githubusercontent.com/ldg118/CF-Worker-BestIP/refs/heads/main/docs/images/3.png)
 
 ## 快速开始
@@ -93,29 +96,32 @@ ADMIN_PASSWORD = your_secure_password
 0 * * * *    # 每小时执行一次
 ```
 
-> **⚠️ 子请求限制说明**：
+> **⚠️ 子请求限制说明**：>   
 > Cloudflare Workers 免费版每个请求最多 50 个子请求。代码已优化，使用完整 50 个子请求限制：
 >
 > **单域名模式**（只设置主域名或只设置国家域名）：
+>
 > - **测速阶段**：最多 **17 个 IP** × 2 个子请求 = 34 个子请求
 > - **DNS 更新阶段**：约 8-11 个子请求（查询 1 + 删除 2-3 + 创建 3 + KV 操作 2-4）
 > - **通知**：1 个子请求
 > - **总计**：约 48-50 个子请求 ✅
 >
 > **双域名模式**（同时设置主域名和国家域名）：
+>
 > - **测速阶段**：最多 **14 个 IP** × 2 个子请求 = 28 个子请求
 > - **DNS 更新阶段**：约 10-12 个子请求（双域名 DNS 操作 + KV 操作）
 > - **通知**：1 个子请求
 > - **总计**：约 48-50 个子请求 ✅
 >
 > **动态调整机制**：
+>
 > - 测速阶段根据实际子请求消耗动态控制 IP 数量
 > - 单域名稳定上限：**17 个 IP**（超过可能无法完成 DNS 更新和通知）
 > - 双域名稳定上限：**14 个 IP**（DNS 预算更多，测速 IP 相应减少）
 > - DNS 更新支持 1-3 个 IP，根据剩余子请求自动调整
 > - 国家域名采用轮询机制，每次只更新一个国家
 
-***
+---
 
 ### 方式二：Cloudflare Pages 部署
 
@@ -239,7 +245,7 @@ ADMIN_PASSWORD = your_secure_password
 
 同方案 A 的步骤 3、5、6。
 
-***
+---
 
 ## 配置说明
 
@@ -251,16 +257,16 @@ ADMIN_PASSWORD = your_secure_password
 
 ### 可选配置
 
-| 变量名                           | 说明           | 默认值  | 范围      |
-| ----------------------------- | ------------ | ---- | ------- |
-| `DEFAULT_IP_COUNT`            | 默认返回 IP 数量   | `3`  | 1-10    |
-| `DEFAULT_TEST_COUNT`          | 默认测试 IP 数量   | `30` | 10-100  |
-| `DEFAULT_THREAD_COUNT`        | 默认测试线程数      | `10` | 1-10    |
-| `DEFAULT_BANDWIDTH_FILE_SIZE` | 带宽测试文件大小(MB) | `3`  | 3-10    |
-| `FAILED_IP_COOLDOWN_DAYS`     | 失败 IP 冷却天数   | `15` | 1-30    |
-| `MAX_HIGH_QUALITY_POOL_SIZE`  | 带宽优质池最大容量   | `20` | 10-50   |
+| 变量名                           | 说明           | 默认值  | 范围     |
+| ----------------------------- | ------------ | ---- | ------ |
+| `DEFAULT_IP_COUNT`            | 默认返回 IP 数量   | `3`  | 1-10   |
+| `DEFAULT_TEST_COUNT`          | 默认测试 IP 数量   | `30` | 10-100 |
+| `DEFAULT_THREAD_COUNT`        | 默认测试线程数      | `10` | 1-10   |
+| `DEFAULT_BANDWIDTH_FILE_SIZE` | 带宽测试文件大小(MB) | `3`  | 3-10   |
+| `FAILED_IP_COOLDOWN_DAYS`     | 失败 IP 冷却天数   | `15` | 1-30   |
+| `MAX_HIGH_QUALITY_POOL_SIZE`  | 带宽优质池最大容量    | `20` | 10-50  |
 
-***
+---
 
 ## 使用指南
 
@@ -293,7 +299,7 @@ ADMIN_PASSWORD = your_secure_password
 2. 获取 Chat ID（[@userinfobot](https://t.me/userinfobot)）
 3. 在 **DNS 设置** → **Telegram 通知** 中填入
 
-***
+---
 
 ## 获取 API Token
 
@@ -310,7 +316,7 @@ ADMIN_PASSWORD = your_secure_password
 6. 资源选择你的账户和域名
 7. 点击 **Create Token**
 
-***
+---
 
 ## 项目结构
 
@@ -328,28 +334,29 @@ cf-best-ip/
 
 ### 部署文件说明
 
-| 文件                        | Workers 部署 | Pages 自动部署（Git） | Pages 直接上传 | 说明       |
-| ------------------------- | ---------- | --------------- | ------------ | -------- |
-| `worker.js`               | ✅ 直接使用     | ✅ 直接使用          | ⚠️ 可选（优先使用 _worker.js） | 主程序文件    |
-| `_worker.js`              | ❌ 不使用      | ❌ 不使用           | ✅ 直接使用          | 主程序文件（Pages 专用） |
-| `functions/[[path]].js`   | ❌ 不使用      | ✅ 推荐使用          | ✅ 推荐使用          | Pages Functions 入口（推荐） |
-| `wrangler.toml`           | ✅ 必需       | ⚠️ 可选            | ⚠️ 可选         | 配置文件     |
-| `migrations/001_init.sql` | ✅ 必需       | ✅ 必需            | ✅ 必需         | 数据库初始化脚本 |
+| 文件                        | Workers 部署 | Pages 自动部署（Git） | Pages 直接上传              | 说明                     |
+| ------------------------- | ---------- | --------------- | ----------------------- | ---------------------- |
+| `worker.js`               | ✅ 直接使用     | ✅ 直接使用          | ⚠️ 可选（优先使用 \_worker.js） | 主程序文件                  |
+| `_worker.js`              | ❌ 不使用      | ❌ 不使用           | ✅ 直接使用                  | 主程序文件（Pages 专用）        |
+| `functions/[[path]].js`   | ❌ 不使用      | ✅ 推荐使用          | ✅ 推荐使用                  | Pages Functions 入口（推荐） |
+| `wrangler.toml`           | ✅ 必需       | ⚠️ 可选           | ⚠️ 可选                   | 配置文件                   |
+| `migrations/001_init.sql` | ✅ 必需       | ✅ 必需            | ✅ 必需                    | 数据库初始化脚本               |
 
 > **注意**：
+>
 > - **Pages 自动部署（Git）**：推荐使用 `functions/[[path]].js`，这是 Pages 的现代推荐方式
 > - **Pages 直接上传**：可以使用 `_worker.js` 或 `functions/[[path]].js`
 > - **Workers 部署**：直接使用 `worker.js`，无需重命名
 
 ### 部署方式对比
 
-| 方式                  | 文件要求         | 定时任务  | 推荐度     |
-| ------------------- | ------------ | ----- | ------- |
-| **方式一 Workers**     | `worker.js`  | ✅ 支持  | ⭐⭐⭐ 最推荐 |
-| **方式二 A Pages 自动部署（Git）** | `functions/[[path]].js`  | ❌ 不支持 | ⭐⭐ 推荐   |
-| **方式二 B Pages 直接上传**  | `_worker.js` 或 `functions/[[path]].js` | ❌ 不支持 | ⭐⭐ 推荐   |
+| 方式                        | 文件要求                                   | 定时任务  | 推荐度     |
+| ------------------------- | -------------------------------------- | ----- | ------- |
+| **方式一 Workers**           | `worker.js`                            | ✅ 支持  | ⭐⭐⭐ 最推荐 |
+| **方式二 A Pages 自动部署（Git）** | `functions/[[path]].js`                | ❌ 不支持 | ⭐⭐ 推荐   |
+| **方式二 B Pages 直接上传**      | `_worker.js` 或 `functions/[[path]].js` | ❌ 不支持 | ⭐⭐ 推荐   |
 
-***
+---
 
 ## 常见问题
 
@@ -373,7 +380,7 @@ cf-best-ip/
 
 **A**: 确认根目录存在 `_worker.js` 文件，这是 Pages 识别 Worker 的必要条件。
 
-***
+---
 
 ## 技术栈
 
@@ -383,7 +390,7 @@ cf-best-ip/
 - **前端**: 原生 HTML + CSS + JavaScript
 - **部署**: Cloudflare Dashboard 控制台
 
-***
+---
 
 ## 更新日志
 
@@ -394,14 +401,14 @@ cf-best-ip/
 - 改进 UI 响应式设计
 - 修复 DNS 批量更新问题
 
-***
+---
 
 ## 许可证
 
 [MIT License](./LICENSE)
 
-***
+---
 
-<p align="center">
-  如果这个项目对你有帮助，请给个 ⭐ Star 支持一下！
+<p align="center">  
+  如果这个项目对你有帮助，请给个 ⭐ Star 支持一下！  
 </p>

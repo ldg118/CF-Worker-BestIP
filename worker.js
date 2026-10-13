@@ -6110,12 +6110,25 @@ async function fullCronSpeedTestLimited(env, ctx, maxSubrequests, maxTestIPs = 1
 
   try {
 
-    const allIPsResult = await getAllIPs(env, true);
-    const allIPs = allIPsResult.ips;
+    let allIPsResult = await getAllIPs(env, true);
+    let allIPs = allIPsResult.ips;
     subrequestCount += allIPsResult.subrequestCount;
 
     if (allIPs.length === 0) {
-      await addSystemLog(env, `⚠️ 没有可测速的IP`);
+      // 总池为空时自动从数据源拉取一次，避免空池卡死（cron 从不刷新 ip_list，只有手动保存数据源才会触发）
+      await addSystemLog(env, `⚠️ 总池为空，自动从数据源拉取IP列表`);
+      try {
+        await updateIPs(env);
+        allIPsResult = await getAllIPs(env, true);
+        allIPs = allIPsResult.ips;
+        subrequestCount += allIPsResult.subrequestCount;
+      } catch (e) {
+        await addSystemLog(env, `❌ 自动拉取IP列表失败: ${e.message}`);
+      }
+    }
+
+    if (allIPs.length === 0) {
+      await addSystemLog(env, `⚠️ 没有可测速的IP（数据源为空或拉取失败）`);
       return { successCount: 0, failCount: 0, bandwidthCount: 0, subrequestCount };
     }
 
